@@ -1,0 +1,303 @@
+"""
+Executor — Operações de arquivo seguras (Mover / Deletar).
+
+Implementa executores para as ações sugeridas pelo Motor de Regras (Seção 3.4)
+e pela aba de Duplicatas.
+
+Princípios de segurança:
+  • Deleção por padrão envia para a Lixeira do Windows (send2trash).
+  • Toda operação é registrada em log (undo log serializável).
+  • Erros de permissão (AV / Kaspersky) são tratados graciosamente.
+  • Um QThread (FileActionWorker) permite execução sem travar a GUI.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal
+
+from PyQt6.QtCore import QThread, pyqtSignal
+
+logger = logging.getLogger(__name__)
+
+# Tentar importar send2trash para deleção segura (Lixeira).
+try:
+    from send2trash import send2trash as _send2trash
+
+    _HAS_SEND2TRASH = True
+except ImportError:
+    _HAS_SEND2TRASH = False
+    logger.warning(
+        "Pacote 'send2trash' não encontrado. "
+        "Deleção de arquivos será PERMANENTE (sem Lixeira)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Registro de operação (undo log)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class OperationRecord:
+    """Registro de uma operação executada (para auditoria / undo)."""
+    timestamp: float
+    action: Literal["MOVER", "DELETAR"]
+    source_path: str
+    target_path: str = ""       # Preenchido apenas para MOVER
+    success: bool = False
+    error: str = ""
+    used_trash: bool = False    # True se foi para a Lixeira
+
+    @property
+    def timestamp_str(self) -> str:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.timestamp))
+
+    def __repr__(self) -> str:
+        status = "OK" if self.success else f"FALHA: {self.error}"
+        return (
+            f"<Op [{self.action}] {Path(self.source_path).name} "
+            f"→ {self.target_path or 'Lixeira'} | {status}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# SafeFileExecutor
+# ---------------------------------------------------------------------------
+
+class SafeFileExecutor:
+    """
+    Executor seguro de operações de arquivo.
+
+    Uso::
+
+        executor = SafeFileExecutor()
+        record = executor.move_file("C:/a.mkv", "D:/Videos/a.mkv")
+        record = executor.delete_file("C:/copia.txt")
+        print(executor.history)
+    """
+
+    def __init__(self):
+        self.history: list[OperationRecord] = []
+
+    def move_file(self, source: str, target: str) -> OperationRecord:
+        """
+        Move um arquivo de `source` para `target`.
+
+        Cria diretórios intermediários automaticamente. Preserva metadados.
+        Se já existir arquivo no destino, adiciona sufixo numérico.
+
+        Parameters
+        ----------
+        source : str
+            Caminho completo do arquivo de origem.
+        target : str
+            Caminho completo do destino (incluindo nome do arquivo).
+
+        Returns
+        -------
+        OperationRecord com o resultado da operação.
+        """
+        record = OperationRecord(
+            timestamp=time.time(),
+            action="MOVER",
+            source_path=source,
+            target_path=target,
+        )
+
+        try:
+            src = Path(source)
+            if not src.exists():
+                record.error = "Arquivo de origem não encontrado."
+                logger.error("Move falhou — arquivo não existe: %s", source)
+                self.history.append(record)
+                return record
+
+            # Criar diretório de destino se não existir.
+            dst = Path(target)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+
+            # Evitar sobrescrever: se destino existe, adicionar sufixo.
+            if dst.exists():
+                dst = self._unique_path(dst)
+                record.target_path = str(dst)
+
+            shutil.move(str(src), str(dst))
+            record.success = True
+            logger.info("Arquivo movido: %s → %s", source, dst)
+
+        except PermissionError as exc:
+            record.error = f"Sem permissão (possível bloqueio de antivírus): {exc}"
+            logger.warning("PermissionError ao mover %s: %s", source, exc)
+        except OSError as exc:
+            record.error = f"Erro de I/O: {exc}"
+            logger.error("OSError ao mover %s: %s", source, exc)
+        except Exception as exc:
+            record.error = f"Erro inesperado: {exc}"
+            logger.exception("Erro inesperado ao mover %s", source)
+
+        self.history.append(record)
+        return record
+
+    def delete_file(self, filepath: str, permanent: bool = False) -> OperationRecord:
+        """
+        Deleta um arquivo, enviando para a Lixeira quando possível.
+
+        Parameters
+        ----------
+        filepath : str
+            Caminho completo do arquivo a deletar.
+        permanent : bool
+            Se True, força deleção permanente mesmo com send2trash disponível.
+
+        Returns
+        -------
+        OperationRecord com o resultado da operação.
+        """
+        record = OperationRecord(
+            timestamp=time.time(),
+            action="DELETAR",
+            source_path=filepath,
+        )
+
+        try:
+            p = Path(filepath)
+            if not p.exists():
+                record.error = "Arquivo não encontrado."
+                logger.error("Delete falhou — arquivo não existe: %s", filepath)
+                self.history.append(record)
+                return record
+
+            if _HAS_SEND2TRASH and not permanent:
+                _send2trash(filepath)
+                record.used_trash = True
+                record.success = True
+                logger.info("Arquivo enviado à Lixeira: %s", filepath)
+            else:
+                os.remove(filepath)
+                record.success = True
+                logger.info("Arquivo deletado permanentemente: %s", filepath)
+
+        except PermissionError as exc:
+            record.error = f"Sem permissão (possível bloqueio de antivírus): {exc}"
+            logger.warning("PermissionError ao deletar %s: %s", filepath, exc)
+        except OSError as exc:
+            record.error = f"Erro de I/O: {exc}"
+            logger.error("OSError ao deletar %s: %s", filepath, exc)
+        except Exception as exc:
+            record.error = f"Erro inesperado: {exc}"
+            logger.exception("Erro inesperado ao deletar %s", filepath)
+
+        self.history.append(record)
+        return record
+
+    def undo_last_move(self) -> OperationRecord | None:
+        """
+        Desfaz a última operação de MOVER bem-sucedida.
+
+        Retorna None se não houver operação para desfazer.
+        """
+        for record in reversed(self.history):
+            if record.action == "MOVER" and record.success:
+                # Inverter: mover de volta de target para source.
+                return self.move_file(record.target_path, record.source_path)
+        return None
+
+    @property
+    def successful_operations(self) -> list[OperationRecord]:
+        return [r for r in self.history if r.success]
+
+    @property
+    def failed_operations(self) -> list[OperationRecord]:
+        return [r for r in self.history if not r.success]
+
+    # ---- Helpers -----------------------------------------------------------
+
+    @staticmethod
+    def _unique_path(path: Path) -> Path:
+        """Gera um caminho único adicionando sufixo numérico."""
+        stem = path.stem
+        suffix = path.suffix
+        parent = path.parent
+        counter = 1
+        while path.exists():
+            path = parent / f"{stem}_{counter}{suffix}"
+            counter += 1
+        return path
+
+
+# ---------------------------------------------------------------------------
+# FileActionWorker — QThread para execução em batch
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FileAction:
+    """Define uma ação para o worker executar."""
+    action: Literal["MOVER", "DELETAR"]
+    source_path: str
+    target_path: str = ""
+
+
+class FileActionWorker(QThread):
+    """
+    Thread para executar uma lista de ações de arquivo em background.
+
+    Signals
+    -------
+    progress(str)
+        Mensagem de status intermediário.
+    progress_percent(int)
+        Porcentagem de progresso (0–100).
+    action_completed(OperationRecord)
+        Emitido após cada ação individual.
+    finished_all(list[OperationRecord])
+        Emitido quando todas as ações terminam.
+    """
+
+    progress = pyqtSignal(str)
+    progress_percent = pyqtSignal(int)
+    action_completed = pyqtSignal(object)     # OperationRecord
+    finished_all = pyqtSignal(object)         # list[OperationRecord]
+
+    def __init__(self, actions: list[FileAction], parent=None):
+        super().__init__(parent)
+        self._actions = actions
+        self._abort = False
+        self._executor = SafeFileExecutor()
+
+    def abort(self):
+        """Sinaliza para a thread parar na próxima oportunidade."""
+        self._abort = True
+
+    def run(self):
+        """Executa todas as ações em sequência."""
+        results: list[OperationRecord] = []
+        total = len(self._actions)
+
+        for idx, action in enumerate(self._actions):
+            if self._abort:
+                break
+
+            pct = int(((idx + 1) / max(total, 1)) * 100)
+            name = Path(action.source_path).name
+            self.progress.emit(f"[{idx+1}/{total}] {action.action}: {name}")
+            self.progress_percent.emit(pct)
+
+            if action.action == "MOVER":
+                record = self._executor.move_file(action.source_path, action.target_path)
+            else:
+                record = self._executor.delete_file(action.source_path)
+
+            results.append(record)
+            self.action_completed.emit(record)
+
+        self.progress.emit("Operacoes concluidas.")
+        self.finished_all.emit(results)
+
+    @property
+    def executor(self) -> SafeFileExecutor:
+        return self._executor
