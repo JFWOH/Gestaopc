@@ -30,3 +30,16 @@ Desktop.ini
 # Logs e temporários
 *.log
 *.tmp
+
+# Cobertura de testes
+.coverage
+htmlcov/
+coverage.xml
+
+# Claude Code (configuração local do assistente)
+.claude/
+
+# Banco de dados local gerado em runtime
+*.db
+*.db-wal
+*.db-shm
