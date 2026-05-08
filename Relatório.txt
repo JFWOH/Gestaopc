@@ -1,5 +1,5 @@
 Relatório Técnico Completo — GestaoPC Storage Manager
-Versão: 0.2 · Python: 3.11+ · Plataforma: Windows 11
+Versão: 0.3-dev · Python: 3.11+ · Plataforma: Windows 11
 Atualizado em: 2026-05-07
 
 ====================================================================
@@ -17,16 +17,15 @@ O aplicativo evoluiu de um sistema estritamente transitório para um ecossistema
 - Algoritmo Anti-Duplicatas (3 Etapas): Compara por tamanho exato, hash de amostras das pontas (2MB) e finalmente hash SHA-256 completo.
 - Motor de Regras Inteligentes: Identifica padrões (ex: arquivo de mídia de 50GB em um NVMe veloz que deveria estar em um disco SATA lento de backup).
 - Histórico Persistente: Operações como Mover/Deletar são registradas em um banco de dados SQLite local, garantindo um "Undo" seguro.
-- Servidor MCP Embutido: Expõe dados do sistema (partições, sugestões, histórico) para clientes LLM externos via Model Context Protocol.
+- Servidor MCP Completo: Expõe 13 tools (7 leitura + request_confirmation + 5 executivas) e 3 resources JSON para clientes LLM externos via Model Context Protocol. Ações executivas auditadas com ai_source='ai:mcp'.
 - Assistente IA Local (Ollama): Aba de chat integrada à GUI que conecta diretamente a modelos LLM locais (llama3, qwen2.5, etc.) rodando via Ollama, com contexto dinâmico do estado dos discos injetado automaticamente.
 
 ====================================================================
-2.1 LIMITAÇÕES CONHECIDAS (v0.2)
+2.1 LIMITAÇÕES CONHECIDAS (v0.3-dev)
 ====================================================================
-- Servidor MCP somente-leitura: expõe apenas partições e configurações. Não permite ações executivas (mover, deletar, undo) via MCP. Expansão prevista para Sprint 2.
 - Assistente Ollama sem tool-calling: o LLM recebe o estado do sistema como texto, mas não pode executar ações diretamente. Suporte a function-calling previsto para Sprint 3.
 - Contexto do Assistente limitado: apenas partições são injetadas como contexto. Duplicatas, sugestões e histórico ainda não são incluídos. Melhoria prevista para Sprint 3.
-- Cobertura de testes: 136 testes cobrem os módulos do core. GUI, Ollama Client, MCP server e AssistantTab não possuem testes automatizados (cobertura total: 22%). Meta: ≥80% ao final do Sprint 6.
+- Cobertura de testes: 234 testes (Sprints 0-2). GUI, Ollama Client e AssistantTab não possuem testes automatizados (cobertura total: 32%). Meta: ≥80% ao final do Sprint 6.
 - Skills RAG: não implementado. Previsto para Sprint 4.
 
 ====================================================================
@@ -123,8 +122,8 @@ Para relatório de cobertura:
 ====================================================================
 8. ROADMAP — EVOLUÇÃO DO AGENTE AUTÔNOMO
 ====================================================================
-Sprint 1 — Camada ai_toolbelt: módulo centralizado com 12 tools compartilhadas entre MCP e Ollama (ver specs/02-ai-toolbelt.md).
-Sprint 2 — MCP Completo: servidor expandido com tools executivas (mover, deletar, undo) e política de confirmação com token.
+Sprint 1 — Camada ai_toolbelt: ✅ CONCLUÍDO. Módulo centralizado com 13 tools compartilhadas entre MCP e Ollama (67 testes, 72% cobertura).
+Sprint 2 — MCP Completo: ✅ CONCLUÍDO. Servidor reescrito com 13 tools executivas, 3 resources JSON, token de confirmação one-shot (31 testes, 97% cobertura).
 Sprint 3 — Ollama com Tool-Calling: loop agente com function-calling para modelos compatíveis; contexto dinâmico enriquecido (duplicatas + sugestões + histórico).
 Sprint 4 — Skills RAG: pasta `skills/*.md` com perfis de limpeza selecionáveis na GUI sem alterar código Python.
 Sprint 5 — Refatoração GUI: `main_window.py` quebrado em sub-widgets por aba; sinal global `ai_action_executed`.
