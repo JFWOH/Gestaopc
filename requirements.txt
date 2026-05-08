@@ -1,0 +1,8 @@
+psutil>=5.9
+PyQt6>=6.6
+send2trash>=1.8
+mcp>=1.0.0
+
+# Dependências de Desenvolvimento
+pytest>=7.0
+ruff>=0.4
