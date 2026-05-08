@@ -23,9 +23,7 @@ O aplicativo evoluiu de um sistema estritamente transitório para um ecossistema
 ====================================================================
 2.1 LIMITAÇÕES CONHECIDAS (v0.3-dev)
 ====================================================================
-- Assistente Ollama sem tool-calling: o LLM recebe o estado do sistema como texto, mas não pode executar ações diretamente. Suporte a function-calling previsto para Sprint 3.
-- Contexto do Assistente limitado: apenas partições são injetadas como contexto. Duplicatas, sugestões e histórico ainda não são incluídos. Melhoria prevista para Sprint 3.
-- Cobertura de testes: 234 testes (Sprints 0-2). GUI, Ollama Client e AssistantTab não possuem testes automatizados (cobertura total: 32%). Meta: ≥80% ao final do Sprint 6.
+- Cobertura de testes: 259 testes (Sprints 0-3). GUI principal e workers não possuem testes automatizados (cobertura total: 33%). Meta: ≥80% ao final do Sprint 6.
 - Skills RAG: não implementado. Previsto para Sprint 4.
 
 ====================================================================
@@ -124,7 +122,7 @@ Para relatório de cobertura:
 ====================================================================
 Sprint 1 — Camada ai_toolbelt: ✅ CONCLUÍDO. Módulo centralizado com 13 tools compartilhadas entre MCP e Ollama (67 testes, 72% cobertura).
 Sprint 2 — MCP Completo: ✅ CONCLUÍDO. Servidor reescrito com 13 tools executivas, 3 resources JSON, token de confirmação one-shot (31 testes, 97% cobertura).
-Sprint 3 — Ollama com Tool-Calling: loop agente com function-calling para modelos compatíveis; contexto dinâmico enriquecido (duplicatas + sugestões + histórico).
+Sprint 3 — Ollama com Tool-Calling: ✅ CONCLUÍDO. Loop agente com chat_with_tools(), contexto enriquecido (partições + sugestões + duplicatas + histórico), 25 testes (95% cov ollama_client).
 Sprint 4 — Skills RAG: pasta `skills/*.md` com perfis de limpeza selecionáveis na GUI sem alterar código Python.
 Sprint 5 — Refatoração GUI: `main_window.py` quebrado em sub-widgets por aba; sinal global `ai_action_executed`.
 Sprint 6 — Hardening: sanitização de paths, limites de execução, telemetria local opt-in, bump para v0.3.0.
