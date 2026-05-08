@@ -11,6 +11,8 @@ Integração com backend via QThread (workers.py) — Seção 6.4.
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QSize, QTimer
@@ -18,12 +20,15 @@ from PyQt6.QtGui import QFont, QIcon, QColor, QPalette, QCloseEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -53,7 +58,9 @@ from src.core.executor import (
     FileActionWorker,
     OperationRecord,
 )
+from src.core.storage_db import StorageManagerDB, get_default_db_path
 from src.gui.icon import create_app_icon, create_tray_icon
+from src.gui.assistant_tab import AssistantTab
 
 logger = logging.getLogger(__name__)
 
@@ -325,7 +332,16 @@ class MainWindow(QMainWindow):
         self._scan_worker: FullScanWorker | None = None
         self._action_worker: FileActionWorker | None = None
         self._last_result: ScanResult | None = None
-        self._executor = SafeFileExecutor()
+        
+        self._db = StorageManagerDB(get_default_db_path())
+        self._db.initialize()
+        self._executor = SafeFileExecutor(db=self._db)
+
+        # Timer para animação de pulso no botão de varredura
+        self._pulse_timer = QTimer(self)
+        self._pulse_timer.setInterval(600)
+        self._pulse_timer.timeout.connect(self._pulse_scan_button)
+        self._pulse_state = False
 
         # Container central
         central = QWidget()
@@ -346,6 +362,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_tab_duplicates(), "  Duplicatas  ")
         self.tabs.addTab(self._build_tab_suggestions(), "  Sugestoes da IA  ")
         self.tabs.addTab(self._build_tab_history(), "  Historico  ")
+        self.tabs.addTab(AssistantTab(self), "  Assistente IA  ")
         root_layout.addWidget(self.tabs, stretch=1)
 
         # ---- Status bar com progress bar embutida
@@ -403,6 +420,8 @@ class MainWindow(QMainWindow):
             self._action_worker.abort()
             self._action_worker.quit()
             self._action_worker.wait(5000)
+        if hasattr(self, '_db'):
+            self._db.close()
         self._tray.hide()
         event.accept()
 
@@ -561,6 +580,27 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(_make_separator())
 
+        # Toolbar: busca + filtro de categoria
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(10)
+
+        self._top_files_search = QLineEdit()
+        self._top_files_search.setPlaceholderText("🔍  Buscar arquivo ou caminho...")
+        self._top_files_search.setFixedHeight(34)
+        self._top_files_search.textChanged.connect(self._filter_top_files_table)
+        toolbar.addWidget(self._top_files_search, stretch=1)
+
+        self._top_files_cat_filter = QComboBox()
+        self._top_files_cat_filter.addItems([
+            "Todas as categorias", "Vídeos", "Imagens",
+            "Documentos", "Executáveis", "Compactados", "Outros",
+        ])
+        self._top_files_cat_filter.setFixedHeight(34)
+        self._top_files_cat_filter.currentTextChanged.connect(self._filter_top_files_table)
+        toolbar.addWidget(self._top_files_cat_filter)
+
+        layout.addLayout(toolbar)
+
         # Tabela
         self.table_top_files = QTableWidget()
         self.table_top_files.setAlternatingRowColors(True)
@@ -569,6 +609,7 @@ class MainWindow(QMainWindow):
         )
         self.table_top_files.verticalHeader().setVisible(False)
         self.table_top_files.setShowGrid(False)
+        self.table_top_files.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
         columns = ["#", "Arquivo", "Caminho", "Tamanho", "Categoria", "Disco"]
         self.table_top_files.setColumnCount(len(columns))
@@ -586,6 +627,14 @@ class MainWindow(QMainWindow):
         h.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
         h.resizeSection(5, 60)
 
+        # Mapa de caminho por linha para o context menu
+        self._top_files_path_map: dict[int, str] = {}
+        self.table_top_files.customContextMenuRequested.connect(
+            lambda pos: self._show_table_context_menu(
+                self.table_top_files, self._top_files_path_map, pos
+            )
+        )
+
         layout.addWidget(self.table_top_files, stretch=1)
 
         # Gráfico de categorias
@@ -602,6 +651,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(footer)
 
         return page
+
 
     # ===================================================================
     # Aba — Pastas (Top Diretórios)
@@ -703,6 +753,14 @@ class MainWindow(QMainWindow):
 
         toolbar.addStretch()
 
+        # Barra de busca nas duplicatas
+        self._dup_search = QLineEdit()
+        self._dup_search.setPlaceholderText("🔍  Buscar arquivo ou hash...")
+        self._dup_search.setFixedHeight(34)
+        self._dup_search.setFixedWidth(280)
+        self._dup_search.textChanged.connect(self._filter_duplicates_table)
+        toolbar.addWidget(self._dup_search)
+
         btn_rescan = QPushButton("Re-escanear")
         btn_rescan.setProperty("cssClass", "secondary")
         btn_rescan.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -719,6 +777,7 @@ class MainWindow(QMainWindow):
         )
         self.table_duplicates.verticalHeader().setVisible(False)
         self.table_duplicates.setShowGrid(False)
+        self.table_duplicates.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
         columns = ["", "Arquivo", "Caminho", "Tamanho", "Hash (parcial)", "Grupo"]
         self.table_duplicates.setColumnCount(len(columns))
@@ -742,7 +801,14 @@ class MainWindow(QMainWindow):
         self._dup_file_paths: dict[int, str] = {}
         self._dup_checkboxes: list[QCheckBox] = []
 
+        self.table_duplicates.customContextMenuRequested.connect(
+            lambda pos: self._show_table_context_menu(
+                self.table_duplicates, self._dup_file_paths, pos
+            )
+        )
+
         return page
+
 
     # ===================================================================
     # Aba 4 — Sugestões da IA — Dinâmica
@@ -890,7 +956,23 @@ class MainWindow(QMainWindow):
 
     def _refresh_history_tab(self):
         """Atualiza a tabela de histórico com os dados do executor."""
-        records = self._executor.history
+        db_rows = self._db.list_operations() if hasattr(self, '_db') else []
+        
+        records = []
+        if db_rows:
+            for row in db_rows:
+                records.append(OperationRecord(
+                    timestamp=row["timestamp"],
+                    action=row["action"],
+                    source_path=row["source_path"],
+                    target_path=row["target_path"] or "",
+                    success=bool(row["success"]),
+                    error=row["error"] or "",
+                    used_trash=bool(row["used_trash"])
+                ))
+        else:
+            records = list(reversed(self._executor.history))
+
         self.table_history.setRowCount(0)
 
         if not records:
@@ -907,7 +989,7 @@ class MainWindow(QMainWindow):
         has_moves = any(r.action == "MOVER" and r.success for r in records)
         self._btn_undo.setEnabled(has_moves)
 
-        for idx, record in enumerate(reversed(records)):  # Mais recente primeiro
+        for idx, record in enumerate(records):  # Mais recente primeiro
             self.table_history.insertRow(idx)
 
             status = "OK" if record.success else "FALHA"
@@ -965,6 +1047,8 @@ class MainWindow(QMainWindow):
     def _on_clear_history(self):
         """Limpa o histórico de operações."""
         self._executor.history.clear()
+        if hasattr(self, '_db'):
+            self._db.clear_operations()
         self._refresh_history_tab()
         self.status_bar.showMessage("Historico limpo.")
 
@@ -985,6 +1069,10 @@ class MainWindow(QMainWindow):
         self.status_progress.setValue(0)
         self.status_bar.showMessage("Iniciando varredura completa...")
 
+        # Iniciar animação de pulso
+        self._pulse_state = False
+        self._pulse_timer.start()
+
         # Criar e iniciar worker
         self._scan_worker = FullScanWorker(self)
         self._scan_worker.progress.connect(self._on_scan_progress)
@@ -1004,9 +1092,11 @@ class MainWindow(QMainWindow):
         """Chamado quando a varredura termina — atualiza todas as abas."""
         self._last_result = result
 
-        # Restaurar botão
+        # Parar animação e restaurar botão
+        self._pulse_timer.stop()
         self.btn_scan.setEnabled(True)
         self.btn_scan.setText("  Iniciar Varredura Completa  ")
+        self.btn_scan.setStyleSheet("")  # Resetar estilo de pulso
         self.status_progress.setVisible(False)
 
         if result.error:
@@ -1168,6 +1258,8 @@ class MainWindow(QMainWindow):
                 self.table_top_files.setItem(idx, col_idx, item)
 
             self.table_top_files.setRowHeight(idx, 38)
+            # Guardar path para context menu
+            self._top_files_path_map[idx] = file_entry.path
 
         # Resumo no rodapé
         categories = {}
@@ -1282,8 +1374,14 @@ class MainWindow(QMainWindow):
         )
         self._btn_delete_selected.setEnabled(True)
 
+        # Paleta de cores para grupos alternados (6 tons)
+        _GROUP_COLORS = [
+            "#1A2633", "#1A2820", "#25201A", "#201A26", "#1A2025", "#261A1A",
+        ]
+
         row_idx = 0
         for group_idx, group in enumerate(result.duplicates, start=1):
+            row_bg = QColor(_GROUP_COLORS[(group_idx - 1) % len(_GROUP_COLORS)])
             for filepath in group.files:
                 self.table_duplicates.insertRow(row_idx)
 
@@ -1316,12 +1414,14 @@ class MainWindow(QMainWindow):
                 ):
                     item = QTableWidgetItem(value)
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    item.setBackground(row_bg)
                     if col_idx == 3:
                         item.setTextAlignment(
                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
                         )
                     if col_idx == 5:
                         item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                        item.setForeground(QColor(Colors.ACCENT_CYAN))
                     self.table_duplicates.setItem(row_idx, col_idx, item)
 
                 self.table_duplicates.setRowHeight(row_idx, 42)
@@ -1595,8 +1695,101 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(1000, self._on_start_scan)
 
     # ===================================================================
+    # Filtros de Tabela (em tempo real)
+    # ===================================================================
+
+    def _filter_top_files_table(self):
+        """Filtra a tabela de Maiores Arquivos por texto e/ou categoria."""
+        text = self._top_files_search.text().lower()
+        cat_filter = self._top_files_cat_filter.currentText()
+        use_cat = cat_filter != "Todas as categorias"
+
+        for row in range(self.table_top_files.rowCount()):
+            name_item = self.table_top_files.item(row, 1)
+            path_item = self.table_top_files.item(row, 2)
+            cat_item = self.table_top_files.item(row, 4)
+
+            name = name_item.text().lower() if name_item else ""
+            path = path_item.text().lower() if path_item else ""
+            cat = cat_item.text() if cat_item else ""
+
+            match_text = (not text) or (text in name) or (text in path)
+            match_cat = (not use_cat) or (cat == cat_filter)
+
+            self.table_top_files.setRowHidden(row, not (match_text and match_cat))
+
+    def _filter_duplicates_table(self):
+        """Filtra a tabela de Duplicatas pelo texto da barra de busca."""
+        text = self._dup_search.text().lower()
+        for row in range(self.table_duplicates.rowCount()):
+            name_item = self.table_duplicates.item(row, 1)
+            path_item = self.table_duplicates.item(row, 2)
+            hash_item = self.table_duplicates.item(row, 4)
+
+            name = name_item.text().lower() if name_item else ""
+            path = path_item.text().lower() if path_item else ""
+            hash_val = hash_item.text().lower() if hash_item else ""
+
+            match = (not text) or (text in name) or (text in path) or (text in hash_val)
+            self.table_duplicates.setRowHidden(row, not match)
+
+    # ===================================================================
     # Utilitários
     # ===================================================================
+
+    def _pulse_scan_button(self):
+        """Alterna a cor do botão de varredura para criar efeito de pulso."""
+        from src.gui.styles import Colors
+        self._pulse_state = not self._pulse_state
+        if self._pulse_state:
+            self.btn_scan.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {Colors.ACCENT_CYAN_HOVER};
+                    color: white;
+                    border: none;
+                    border-radius: 6px;
+                    padding: 10px 24px;
+                    font-size: 13px;
+                    font-weight: 700;
+                }}
+            """)
+        else:
+            self.btn_scan.setStyleSheet("")
+
+    @staticmethod
+    def _open_in_explorer(filepath: str):
+        """Abre o Explorador de Arquivos com o arquivo selecionado."""
+        try:
+            path = Path(filepath)
+            if path.is_file():
+                subprocess.run(["explorer", "/select,", str(path)], check=False)
+            elif path.is_dir():
+                subprocess.run(["explorer", str(path)], check=False)
+        except Exception as exc:
+            logger.warning("Falha ao abrir Explorer: %s", exc)
+
+    def _show_table_context_menu(self, table: QTableWidget, filepath_map: dict[int, str], pos):
+        """Exibe menu de contexto para uma linha de tabela."""
+        row = table.rowAt(pos.y())
+        if row < 0:
+            return
+        filepath = filepath_map.get(row, "")
+        if not filepath:
+            return
+
+        menu = QMenu(self)
+        act_open = menu.addAction("📂  Abrir pasta no Explorer")
+        act_copy = menu.addAction("📋  Copiar caminho")
+        menu.addSeparator()
+        act_info = menu.addAction(Path(filepath).name)
+        act_info.setEnabled(False)
+
+        action = menu.exec(table.viewport().mapToGlobal(pos))
+        if action == act_open:
+            self._open_in_explorer(filepath)
+        elif action == act_copy:
+            QApplication.clipboard().setText(filepath)
+            self.status_bar.showMessage(f"Caminho copiado: {filepath}")
 
     @staticmethod
     def _update_stat(stat_layout: QVBoxLayout, value: str):

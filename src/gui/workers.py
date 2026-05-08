@@ -21,6 +21,7 @@ from src.core.analyzer import (
     SmartRulesEngine,
     ReallocationSuggestion,
 )
+from src.core.storage_db import StorageManagerDB, get_default_db_path
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,14 @@ class FullScanWorker(QThread):
         """Executa a pipeline completa em background."""
         result = ScanResult()
         start = time.perf_counter()
+        
+        # Conexão própria para esta thread
+        db = StorageManagerDB(get_default_db_path())
+        db.initialize()
+        
+        session_id = db.create_scan_session(started_at=time.time(), scan_mode="full")
+        total_files = 0
+        total_bytes = 0
 
         try:
             scanner = StorageScanner()
@@ -130,6 +139,10 @@ class FullScanWorker(QThread):
             # Consolidar top 50 global de todos os discos.
             all_files.sort(key=lambda f: f.size_bytes, reverse=True)
             result.top_files = all_files[:50]
+            
+            total_files = len(all_files)
+            total_bytes = sum(f.size_bytes for f in all_files)
+            
             logger.info("Top files global: %d entradas.", len(result.top_files))
 
             if self._abort:
@@ -184,6 +197,33 @@ class FullScanWorker(QThread):
                 result.partitions,
                 result.duplicates,
             )
+            
+            # -- Persistir Resultados no DB --
+            db.clear_suggestions()
+            for sugg in result.suggestions:
+                db.insert_suggestion(
+                    scan_session_id=session_id,
+                    rule_id=sugg.rule_id,
+                    rule_name=sugg.rule_name,
+                    file_path=sugg.file_path,
+                    action=sugg.action,
+                    detail=sugg.detail,
+                    target_disk=sugg.target_disk,
+                    priority=sugg.priority,
+                    created_at=time.time()
+                )
+            
+            for f in result.top_files:
+                drive_letter = f.path[:2] if len(f.path) >= 2 and f.path[1] == ':' else None
+                db.upsert_file_index(
+                    path=f.path,
+                    disk_letter=drive_letter,
+                    size_bytes=f.size_bytes,
+                    mtime=f.modified_time,
+                    category=f.category,
+                    last_seen=time.time()
+                )
+                
             logger.info("Sugestoes geradas: %d.", len(result.suggestions))
 
             self.progress_percent.emit(100)
@@ -196,6 +236,16 @@ class FullScanWorker(QThread):
 
         finally:
             result.elapsed_seconds = time.perf_counter() - start
+            
+            db.finish_scan_session(
+                session_id,
+                elapsed_seconds=result.elapsed_seconds,
+                total_files_seen=total_files,
+                total_bytes_seen=total_bytes,
+                error=result.error
+            )
+            db.close()
+            
             self.finished_result.emit(result)
 
     # ---- Helpers ────────────────────────────────────────────────────────
