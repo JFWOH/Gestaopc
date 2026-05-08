@@ -1,5 +1,5 @@
 """
-Aba do Assistente IA Local — integração com Ollama via tool-calling.
+Aba do Assistente IA Local — integração com Ollama via tool-calling e Skills RAG.
 
 Fluxo de interação:
   1. Usuário envia mensagem.
@@ -15,6 +15,7 @@ Contexto injetado automaticamente (via _get_system_context):
   - Sugestões pendentes do SmartRulesEngine (do DB)
   - Resumo de duplicatas grandes (do DB)
   - Últimas 5 operações do histórico (do DB)
+  - Instruções da Skill selecionada (RAG — lida de skills/*.md)
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from PyQt6.QtGui import QTextCursor
 
 import src.core.ai_toolbelt as tb
 from src.core.ollama_client import OllamaClient
+from src.core.skills_loader import Skill, load_skills
 from src.core.storage_db import StorageManagerDB, get_default_db_path
 from src.gui.styles import Colors
 
@@ -178,6 +180,10 @@ class AssistantTab(QWidget):
         self._current_response_text = ""
         self._worker: OllamaAgentWorker | OllamaChatWorker | None = None
 
+        # Skills RAG: carregadas uma vez na inicialização
+        self._skills: list[Skill] = load_skills()
+        self._selected_skill: Skill | None = None
+
         self._build_ui()
         self._refresh_models()
 
@@ -198,6 +204,18 @@ class AssistantTab(QWidget):
         )
         header.addWidget(title)
         header.addStretch()
+
+        # ── Seletor de Skill RAG ─────────────────────────────────────────
+        if self._skills:
+            header.addWidget(QLabel("Skill:"))
+            self.combo_skills = QComboBox()
+            self.combo_skills.setFixedWidth(175)
+            self.combo_skills.setFixedHeight(30)
+            self.combo_skills.addItem("Padrão (sem skill)")
+            for skill in self._skills:
+                self.combo_skills.addItem(skill.name)
+            self.combo_skills.currentIndexChanged.connect(self._on_skill_changed)
+            header.addWidget(self.combo_skills)
 
         header.addWidget(QLabel("Modelo:"))
         self.combo_models = QComboBox()
@@ -267,6 +285,19 @@ class AssistantTab(QWidget):
         input_layout.addWidget(self.btn_send)
 
         layout.addLayout(input_layout)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Skills RAG
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _on_skill_changed(self, index: int):
+        """Atualiza a skill selecionada e reinicia o histórico de mensagens."""
+        if index <= 0:
+            self._selected_skill = None
+        else:
+            self._selected_skill = self._skills[index - 1]
+        # Resetar conversa quando a skill muda (contexto de sistema muda)
+        self._messages.clear()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Modelos Ollama
@@ -413,6 +444,16 @@ class AssistantTab(QWidget):
             "",
             "Responda de forma clara e concisa. Para dados detalhados, use as tools disponíveis.",
         ]
+
+        # ── Skill RAG selecionada ───────────────────────────────────────────
+        if self._selected_skill:
+            lines += [
+                "",
+                f"=== MODO ATIVO: {self._selected_skill.name.upper()} ===",
+                self._selected_skill.content,
+                f"=== FIM DO MODO {self._selected_skill.name.upper()} ===",
+            ]
+
         return "\n".join(lines)
 
     # ─────────────────────────────────────────────────────────────────────────
