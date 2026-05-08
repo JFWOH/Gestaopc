@@ -23,6 +23,8 @@ from typing import Literal
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from src.core.storage_db import StorageManagerDB
+
 logger = logging.getLogger(__name__)
 
 # Tentar importar send2trash para deleção segura (Lixeira).
@@ -81,8 +83,23 @@ class SafeFileExecutor:
         print(executor.history)
     """
 
-    def __init__(self):
+    def __init__(self, db: StorageManagerDB | None = None):
         self.history: list[OperationRecord] = []
+        self._db = db
+
+    def _persist_record(self, record: OperationRecord) -> None:
+        """Persiste o OperationRecord no banco de dados, se configurado."""
+        if self._db is None:
+            return
+        self._db.insert_operation(
+            timestamp=record.timestamp,
+            action=record.action,
+            source_path=record.source_path,
+            target_path=record.target_path,
+            success=record.success,
+            error=record.error or "",
+            used_trash=record.used_trash,
+        )
 
     def move_file(self, source: str, target: str) -> OperationRecord:
         """
@@ -141,6 +158,7 @@ class SafeFileExecutor:
             logger.exception("Erro inesperado ao mover %s", source)
 
         self.history.append(record)
+        self._persist_record(record)
         return record
 
     def delete_file(self, filepath: str, permanent: bool = False) -> OperationRecord:
@@ -193,6 +211,7 @@ class SafeFileExecutor:
             logger.exception("Erro inesperado ao deletar %s", filepath)
 
         self.history.append(record)
+        self._persist_record(record)
         return record
 
     def undo_last_move(self) -> OperationRecord | None:
@@ -263,11 +282,11 @@ class FileActionWorker(QThread):
     action_completed = pyqtSignal(object)     # OperationRecord
     finished_all = pyqtSignal(object)         # list[OperationRecord]
 
-    def __init__(self, actions: list[FileAction], parent=None):
+    def __init__(self, actions: list[FileAction], db: StorageManagerDB | None = None, parent=None):
         super().__init__(parent)
         self._actions = actions
         self._abort = False
-        self._executor = SafeFileExecutor()
+        self._executor = SafeFileExecutor(db=db)
 
     def abort(self):
         """Sinaliza para a thread parar na próxima oportunidade."""

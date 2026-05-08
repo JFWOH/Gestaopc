@@ -304,4 +304,91 @@ QStatusBar {{
     font-size: {Fonts.SIZE_SMALL}px;
     padding: 4px;
 }}
+
+/* ===== LINE EDIT (Barra de busca) ===== */
+QLineEdit {{
+    background-color: {Colors.BG_INPUT};
+    color: {Colors.TEXT_PRIMARY};
+    border: 1px solid {Colors.BORDER_SUBTLE};
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: {Fonts.SIZE_SMALL}px;
+    selection-background-color: {Colors.ACCENT_CYAN_DIM};
+    selection-color: {Colors.ACCENT_CYAN};
+}}
+QLineEdit:focus {{
+    border-color: {Colors.ACCENT_CYAN};
+    background-color: {Colors.BG_ELEVATED};
+}}
+QLineEdit:hover {{
+    border-color: {Colors.TEXT_DISABLED};
+}}
+
+/* ===== COMBO BOX (Filtro de categoria) ===== */
+QComboBox {{
+    background-color: {Colors.BG_INPUT};
+    color: {Colors.TEXT_PRIMARY};
+    border: 1px solid {Colors.BORDER_SUBTLE};
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: {Fonts.SIZE_SMALL}px;
+    min-width: 140px;
+}}
+QComboBox:hover {{
+    border-color: {Colors.ACCENT_CYAN};
+}}
+QComboBox:focus {{
+    border-color: {Colors.ACCENT_CYAN};
+}}
+QComboBox::drop-down {{
+    border: none;
+    width: 28px;
+}}
+QComboBox::down-arrow {{
+    width: 0;
+    height: 0;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 6px solid {Colors.ACCENT_CYAN};
+    margin-right: 8px;
+}}
+QComboBox QAbstractItemView {{
+    background-color: {Colors.BG_ELEVATED};
+    color: {Colors.TEXT_PRIMARY};
+    border: 1px solid {Colors.ACCENT_CYAN}44;
+    selection-background-color: {Colors.ACCENT_CYAN_DIM};
+    selection-color: {Colors.ACCENT_CYAN};
+    padding: 4px;
+    outline: none;
+}}
+QComboBox QAbstractItemView::item {{
+    padding: 8px 12px;
+    min-height: 28px;
+}}
+
+/* ===== MENU DE CONTEXTO ===== */
+QMenu {{
+    background-color: {Colors.BG_ELEVATED};
+    color: {Colors.TEXT_PRIMARY};
+    border: 1px solid {Colors.BORDER_SUBTLE};
+    border-radius: 8px;
+    padding: 6px;
+    font-size: {Fonts.SIZE_SMALL}px;
+}}
+QMenu::item {{
+    padding: 8px 20px 8px 14px;
+    border-radius: 4px;
+}}
+QMenu::item:selected {{
+    background-color: {Colors.ACCENT_CYAN_DIM};
+    color: {Colors.ACCENT_CYAN};
+}}
+QMenu::item:disabled {{
+    color: {Colors.TEXT_DISABLED};
+}}
+QMenu::separator {{
+    height: 1px;
+    background: {Colors.BORDER_SUBTLE};
+    margin: 4px 8px;
+}}
 """
