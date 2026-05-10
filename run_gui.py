@@ -9,8 +9,8 @@ Uso:
 import logging
 import sys
 
-from PyQt6.QtCore import QTimer
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QApplication
 
 from src.gui.styles import GLOBAL_STYLESHEET
 from src.gui.main_window import MainWindow

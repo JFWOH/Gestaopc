@@ -480,11 +480,14 @@ class TestMoveFile:
         assert result["error"] == "INVALID_TOKEN"
 
     def test_rejects_protected_source(self, tmp_db, tmp_path):
+        # Sprint 7.2: target_path no token e na chamada DEVEM bater (S-2),
+        # caso contrário cai em TOKEN_ARGS_MISMATCH antes do path guard.
+        target = str(tmp_path / "notepad.exe")
         tok = tb.request_confirmation("move_file", {
             "source_path": "C:\\Windows\\notepad.exe",
-            "target_path": str(tmp_path / "notepad.exe"),
+            "target_path": target,
         })
-        result = tb.move_file("C:\\Windows\\notepad.exe", str(tmp_path / "np.exe"), tok["token"])
+        result = tb.move_file("C:\\Windows\\notepad.exe", target, tok["token"])
         assert result["error"] == "PROTECTED_PATH"
 
     def test_source_not_found(self, tmp_db, tmp_path):
@@ -599,7 +602,9 @@ class TestUndoLastOperation:
         assert result["error"] == "INVALID_TOKEN"
 
     def test_no_move_to_undo(self, tmp_db):
-        tok = tb.request_confirmation("undo_last_operation", {})
+        # Sprint 7.2: o fingerprint do token vincula args; passar exatamente
+        # o que a chamada vai usar (operation_id default = None).
+        tok = tb.request_confirmation("undo_last_operation", {"operation_id": None})
         result = tb.undo_last_operation(tok["token"])
         assert result["error"] == "NOT_FOUND"
 
@@ -618,7 +623,9 @@ class TestUndoLastOperation:
                 success=True, source="ui",
             )
 
-        tok = tb.request_confirmation("undo_last_operation", {})
+        # Sprint 7.2: o fingerprint do token vincula args; passar exatamente
+        # o que a chamada vai usar (operation_id default = None).
+        tok = tb.request_confirmation("undo_last_operation", {"operation_id": None})
         result = tb.undo_last_operation(tok["token"])
 
         assert result.get("success") is True
@@ -636,7 +643,9 @@ class TestUndoLastOperation:
                 success=True, source="ui",
             )
 
-        tok = tb.request_confirmation("undo_last_operation", {})
+        # Sprint 7.2: o fingerprint do token vincula args; passar exatamente
+        # o que a chamada vai usar (operation_id default = None).
+        tok = tb.request_confirmation("undo_last_operation", {"operation_id": None})
         result = tb.undo_last_operation(tok["token"])
         assert result["error"] == "FILE_NOT_FOUND"
 
@@ -732,3 +741,229 @@ class TestGetToolSchemas:
             if fn["name"] in read_only_names:
                 props = fn["parameters"].get("properties", {})
                 assert "confirmation_token" not in props, f"{fn['name']} não deveria ter token"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Sprint 7.2 — Hardening de segurança (S-1, S-2, S-4)
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Cobre regressões para as três vulnerabilidades críticas identificadas na
+# auditoria geral:
+#   S-1: path_guard agora aplicado em todas as tools executivas
+#   S-2: token de confirmação vincula fingerprint dos argumentos
+#   S-4: target_disk de apply_suggestion validado antes de escrita
+
+
+class TestS1PathGuardInExecutiveTools:
+    """S-1: path_guard.validate_path agora aplicado em TODAS as tools executivas."""
+
+    def test_move_to_trash_rejects_relative_path(self, tmp_db):
+        tok = tb.request_confirmation("move_to_trash", {"path": "relativo/file.txt"})
+        result = tb.move_to_trash("relativo/file.txt", tok["token"])
+        assert result["error"] == "PROTECTED_PATH"
+
+    def test_move_to_trash_rejects_empty_path(self, tmp_db):
+        tok = tb.request_confirmation("move_to_trash", {"path": ""})
+        result = tb.move_to_trash("", tok["token"])
+        assert result["error"] == "PROTECTED_PATH"
+
+    def test_move_file_rejects_relative_target(self, tmp_path, tmp_db):
+        src = tmp_path / "real.txt"
+        src.write_text("x")
+        tok = tb.request_confirmation("move_file", {
+            "source_path": str(src),
+            "target_path": "relativo/dest.txt",
+        })
+        result = tb.move_file(str(src), "relativo/dest.txt", tok["token"])
+        assert result["error"] == "PROTECTED_PATH"
+
+    def test_move_file_rejects_protected_target(self, tmp_path, tmp_db):
+        """Antes do Sprint 7.2 só a origem era validada — destino podia ser System32."""
+        src = tmp_path / "real.txt"
+        src.write_text("x")
+        evil_target = "C:\\Windows\\System32\\malware.exe"
+        tok = tb.request_confirmation("move_file", {
+            "source_path": str(src),
+            "target_path": evil_target,
+        })
+        result = tb.move_file(str(src), evil_target, tok["token"])
+        assert result["error"] == "PROTECTED_PATH"
+
+    def test_set_disk_role_does_not_need_path_guard(self, tmp_db):
+        """Sanity: set_disk_role não toca em paths, então segue funcionando."""
+        tok = tb.request_confirmation(
+            "set_disk_role", {"drive_letter": "D", "role": "media"}
+        )
+        result = tb.set_disk_role("D", "media", tok["token"])
+        assert result.get("success") is True
+
+    def test_path_guard_blocks_recovery_partition(self, tmp_db):
+        """path_guard cobre RECOVERY/BOOT — ai_toolbelt antes não cobria."""
+        evil = "C:\\Recovery\\WindowsRE\\WinRE.wim"
+        tok = tb.request_confirmation("move_to_trash", {"path": evil})
+        result = tb.move_to_trash(evil, tok["token"])
+        assert result["error"] == "PROTECTED_PATH"
+
+
+class TestS2TokenArgsBinding:
+    """S-2: token de confirmação vincula fingerprint SHA-256 dos argumentos."""
+
+    def test_fingerprint_is_stable_for_same_args(self):
+        fp1 = tb._fingerprint_args({"path": "C:\\a.txt", "x": 1})
+        fp2 = tb._fingerprint_args({"x": 1, "path": "C:\\a.txt"})  # ordem diferente
+        assert fp1 == fp2, "Fingerprint deve ser estável (sort_keys=True)"
+
+    def test_fingerprint_differs_for_different_paths(self):
+        fp1 = tb._fingerprint_args({"path": "C:\\a.txt"})
+        fp2 = tb._fingerprint_args({"path": "C:\\b.txt"})
+        assert fp1 != fp2
+
+    def test_fingerprint_excludes_token_and_source(self):
+        """confirmation_token e ai_source NÃO entram no hash."""
+        fp1 = tb._fingerprint_args({"path": "C:\\a.txt"})
+        fp2 = tb._fingerprint_args({
+            "path": "C:\\a.txt",
+            "confirmation_token": "abc",
+            "ai_source": "ai:mcp",
+        })
+        assert fp1 == fp2
+
+    def test_replay_with_different_path_blocked(self, tmp_path, tmp_db):
+        """ATAQUE: pedir token para path inocente, usar para deletar outro."""
+        innocent = tmp_path / "innocent.txt"
+        innocent.write_text("ok")
+        victim = tmp_path / "victim.txt"
+        victim.write_text("important")
+
+        # IA pede confirmação para o arquivo inocente
+        tok = tb.request_confirmation("move_to_trash", {"path": str(innocent)})
+
+        # IA tenta usar o token para outro arquivo
+        result = tb.move_to_trash(str(victim), tok["token"])
+
+        assert result["error"] == "TOKEN_ARGS_MISMATCH"
+        # E ambos os arquivos permanecem intactos
+        assert innocent.exists()
+        assert victim.exists()
+
+    def test_replay_with_different_target_blocked(self, tmp_path, tmp_db):
+        """ATAQUE: pedir move_file confirmado para D:\\, redirecionar para C:\\Windows."""
+        src = tmp_path / "file.txt"
+        src.write_text("x")
+        approved_target = str(tmp_path / "approved_dest.txt")
+        evil_target = "C:\\Windows\\System32\\evil.exe"
+
+        tok = tb.request_confirmation("move_file", {
+            "source_path": str(src),
+            "target_path": approved_target,
+        })
+
+        result = tb.move_file(str(src), evil_target, tok["token"])
+        assert result["error"] == "TOKEN_ARGS_MISMATCH"
+        assert src.exists(), "Arquivo de origem deve permanecer intacto"
+
+    def test_token_not_consumed_on_args_mismatch(self, tmp_path, tmp_db):
+        """
+        TOKEN_ARGS_MISMATCH não consome o token — a IA pode tentar de novo
+        com os args corretos. Política intencional para reduzir UX hostil.
+        """
+        approved = tmp_path / "approved.txt"
+        approved.write_text("x")
+        wrong = tmp_path / "wrong.txt"
+
+        tok = tb.request_confirmation("move_to_trash", {"path": str(approved)})
+
+        # Tentativa com path errado: deve falhar mas NÃO consumir
+        bad = tb.move_to_trash(str(wrong), tok["token"])
+        assert bad["error"] == "TOKEN_ARGS_MISMATCH"
+
+        # Tentativa com path certo: deve funcionar
+        good = tb.move_to_trash(str(approved), tok["token"])
+        assert good.get("success") is True
+
+    def test_legacy_validate_token_call_without_args_still_works(self):
+        """Compat: chamadas internas sem call_args usam o comportamento antigo."""
+        tok = tb.request_confirmation("set_disk_role", {"drive_letter": "D", "role": "media"})
+        # Chamada legada (call_args=None) só checa action, não args
+        assert tb._validate_token(tok["token"], "set_disk_role") is None
+
+
+class TestS4ApplySuggestionTargetValidation:
+    """S-4: target_disk em apply_suggestion validado antes de move."""
+
+    def _make_evil_suggestion(self, db, target_disk: str, file_path: str) -> int:
+        """Insere uma sugestão maliciosa direto no DB e retorna o id."""
+        with db:
+            return db.insert_suggestion(
+                scan_session_id=None,
+                rule_id=99,
+                rule_name="EVIL",
+                file_path=file_path,
+                action="MOVER",
+                detail="...",
+                target_disk=target_disk,
+                priority="ALTA",
+                created_at=time.time(),
+            )
+
+    def test_apply_suggestion_rejects_protected_target_disk(
+        self, tmp_path, tmp_db, db
+    ):
+        """Sugestão com target_disk='C:\\Windows' não deve ser aplicada."""
+        # Arquivo de origem legítimo
+        src = tmp_path / "media.mkv"
+        src.write_text("filme")
+
+        # Sugestão maliciosa apontando para C:\Windows
+        sid = self._make_evil_suggestion(
+            db, target_disk="C:\\Windows", file_path=str(src),
+        )
+
+        tok = tb.request_confirmation(
+            "apply_suggestion", {"suggestion_id": sid}
+        )
+        result = tb.apply_suggestion(sid, tok["token"])
+
+        assert result["error"] == "PROTECTED_PATH"
+        assert src.exists(), "Origem não deve ter sido movida"
+
+    def test_apply_suggestion_rejects_protected_file_path(
+        self, tmp_path, tmp_db, db
+    ):
+        """Sugestão com file_path apontando para System32 não deve ser executada."""
+        sid = self._make_evil_suggestion(
+            db,
+            target_disk=str(tmp_path),
+            file_path="C:\\Windows\\System32\\notepad.exe",
+        )
+        tok = tb.request_confirmation(
+            "apply_suggestion", {"suggestion_id": sid}
+        )
+        result = tb.apply_suggestion(sid, tok["token"])
+        assert result["error"] == "PROTECTED_PATH"
+
+
+class TestUndoOperationPathValidation:
+    """S-1 (extensão): undo_last_operation valida ambos os caminhos do DB."""
+
+    def test_undo_rejects_protected_target_path_in_history(
+        self, tmp_path, tmp_db, db
+    ):
+        """
+        Cenário: histórico foi adulterado para incluir uma operação cujo
+        target aponta para System32. Undo não deve restaurar cegamente.
+        """
+        with db:
+            db.insert_operation(
+                timestamp=time.time(),
+                action="MOVER",
+                source_path=str(tmp_path / "src.txt"),
+                target_path="C:\\Windows\\malicious.exe",
+                success=True,
+                source="ui",
+            )
+        tok = tb.request_confirmation(
+            "undo_last_operation", {"operation_id": None}
+        )
+        result = tb.undo_last_operation(tok["token"])
+        assert result["error"] == "PROTECTED_PATH"

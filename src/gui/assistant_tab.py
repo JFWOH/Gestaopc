@@ -24,14 +24,19 @@ import json
 import logging
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtWidgets import (
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QCloseEvent
+from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QLineEdit,
     QPushButton, QComboBox, QLabel, QFrame
 )
-from PyQt6.QtGui import QTextCursor
 
 import src.core.ai_toolbelt as tb
+from src.core.config import (
+    WORKER_CLEANUP_TIMEOUT_MS,
+    WORKER_QUIT_TIMEOUT_MS,
+    WORKER_RESTART_TIMEOUT_MS,
+)
 from src.core.ollama_client import OllamaClient
 from src.core.skills_loader import Skill, load_skills
 from src.core.storage_db import StorageManagerDB, get_default_db_path
@@ -79,24 +84,6 @@ def _human_size(size_bytes: int) -> str:
 # Workers (QThreads)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class OllamaChatWorker(QThread):
-    """Thread para chat simples com streaming (fallback sem tool-calling)."""
-
-    token_received = pyqtSignal(str)
-    finished_response = pyqtSignal()
-
-    def __init__(self, model: str, messages: list[dict], parent=None):
-        super().__init__(parent)
-        self.model = model
-        self.messages = messages
-        self._client = OllamaClient()
-
-    def run(self):
-        for token in self._client.chat_stream(self.model, self.messages):
-            self.token_received.emit(token)
-        self.finished_response.emit()
-
-
 class OllamaAgentWorker(QThread):
     """
     Thread para o loop agente com tool-calling.
@@ -105,15 +92,15 @@ class OllamaAgentWorker(QThread):
     """
 
     # Sinaliza início de chamada de tool: (nome_da_tool, resumo_dos_args)
-    tool_call_started = pyqtSignal(str, str)
+    tool_call_started = Signal(str, str)
     # Sinaliza conclusão de chamada: (nome_da_tool, resumo_do_resultado)
-    tool_call_finished = pyqtSignal(str, str)
+    tool_call_finished = Signal(str, str)
     # Texto final do modelo (resposta completa, não streaming)
-    text_received = pyqtSignal(str)
+    text_received = Signal(str)
     # Erro no loop agente
-    error_occurred = pyqtSignal(str)
+    error_occurred = Signal(str)
     # Loop encerrado (com texto ou com erro)
-    finished_response = pyqtSignal()
+    finished_response = Signal()
 
     def __init__(
         self,
@@ -169,6 +156,35 @@ class AssistantTab(QWidget):
     o loop encerra naturalmente com uma resposta de texto.
     """
 
+    # Emitido quando uma tool executiva (mover/deletar/etc.) foi chamada com sucesso.
+    # Permite que a MainWindow atualize a aba Histórico automaticamente.
+    ai_action_executed = Signal()
+
+    # Tools que modificam o sistema de arquivos ou o banco de dados
+    # (deve espelhar EXECUTIVE_ACTIONS em ai_toolbelt.py)
+    _EXECUTIVE_TOOLS = frozenset({
+        "move_file",
+        "move_to_trash",
+        "apply_suggestion",
+        "set_disk_role",
+        "undo_last_operation",
+    })
+
+    # Sprint 7.5: nomes de sinais que conectamos em workers — usado pelo
+    # _disconnect_worker_signals para limpeza idempotente.
+    _WORKER_SIGNAL_NAMES = (
+        "tool_call_started",
+        "tool_call_finished",
+        "text_received",
+        "error_occurred",
+        "finished_response",
+    )
+
+    # Sprint 7.6: timeouts canônicos vivem em src/core/config.py.
+    # Aliases mantidos como constantes de classe para retrocompatibilidade.
+    _WORKER_QUIT_TIMEOUT_MS: int = WORKER_QUIT_TIMEOUT_MS
+    _WORKER_CLEANUP_TIMEOUT_MS: int = WORKER_CLEANUP_TIMEOUT_MS
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._client = OllamaClient()
@@ -178,7 +194,7 @@ class AssistantTab(QWidget):
         # Histórico de mensagens do chat (formato Ollama)
         self._messages: list[dict] = []
         self._current_response_text = ""
-        self._worker: OllamaAgentWorker | OllamaChatWorker | None = None
+        self._worker: OllamaAgentWorker | None = None
 
         # Skills RAG: carregadas uma vez na inicialização
         self._skills: list[Skill] = load_skills()
@@ -186,6 +202,83 @@ class AssistantTab(QWidget):
 
         self._build_ui()
         self._refresh_models()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Sprint 7.5 — Resource lifecycle (S-6, Q-3)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """
+        Cleanup ao destruir o widget:
+          - Para o worker em andamento (quit + wait com timeout)
+          - Fecha a conexão com o DB
+          - Não vaza thread em sessão longa nem deixa FD do SQLite aberto
+        """
+        self._stop_active_worker(timeout_ms=self._WORKER_QUIT_TIMEOUT_MS)
+        try:
+            if hasattr(self, "_db") and self._db is not None:
+                self._db.close()
+                self._db = None
+        except Exception:
+            logger.debug("Erro ao fechar DB do AssistantTab", exc_info=True)
+        super().closeEvent(event)
+
+    def _disconnect_worker_signals(self, worker: QThread | None) -> None:
+        """
+        Disconecta TODOS os slots conectados ao worker para evitar:
+          1. Acúmulo de handlers entre mensagens (signal connect cumulativo)
+          2. Slots disparando em widget já destruído
+
+        Idempotente: ignora silenciosamente sinais inexistentes ou já
+        desconectados (RuntimeError do Qt quando não há connection).
+        """
+        if worker is None:
+            return
+        for sig_name in self._WORKER_SIGNAL_NAMES:
+            sig = getattr(worker, sig_name, None)
+            if sig is None:
+                continue
+            try:
+                sig.disconnect()
+            except (RuntimeError, TypeError):
+                # disconnect() sem args lança RuntimeError se não há conexão
+                pass
+
+    def _stop_active_worker(self, timeout_ms: int = 3000) -> None:
+        """
+        Para o worker ativo (se houver) graciosamente.
+
+        Sequência:
+          1. Captura referência local e zera self._worker (evita reentrância)
+          2. Disconecta sinais (impede slots de disparar durante shutdown)
+          3. Se worker ainda está rodando: quit() + wait(timeout)
+          4. Se não parou no timeout: terminate() + wait curto (fallback)
+          5. Agenda deleteLater() para liberar QObject
+
+        Robusto a exceções — falhas de cleanup nunca propagam para a UI.
+        """
+        worker = self._worker
+        self._worker = None
+        if worker is None:
+            return
+
+        self._disconnect_worker_signals(worker)
+        try:
+            if worker.isRunning():
+                worker.quit()
+                if not worker.wait(timeout_ms):
+                    logger.warning(
+                        "Worker não terminou em %dms — forçando terminate()",
+                        timeout_ms,
+                    )
+                    worker.terminate()
+                    worker.wait(1000)
+        except Exception:
+            logger.debug("Erro ao parar worker", exc_info=True)
+        try:
+            worker.deleteLater()
+        except Exception:
+            pass
 
     # ─────────────────────────────────────────────────────────────────────────
     # Construção da UI
@@ -370,6 +463,9 @@ class AssistantTab(QWidget):
         ]
 
         # ── Partições ──────────────────────────────────────────────────────
+        # Sprint 7.5: usar logger.exception para preservar stack trace em todos
+        # os branches de fallback. Antes, except Exception silenciava sem
+        # diagnóstico — mascarava bugs reais (ex.: scanner crash).
         try:
             parts = tb.list_partitions()
             lines.append("\n[Partições]")
@@ -383,6 +479,7 @@ class AssistantTab(QWidget):
                         f"({p.get('used_pct', 0):.1f}% usado)"
                     )
         except Exception:
+            logger.exception("Falha ao montar contexto: list_partitions()")
             lines.append("[Partições] — Não disponível")
 
         # ── Sugestões pendentes ─────────────────────────────────────────────
@@ -403,6 +500,7 @@ class AssistantTab(QWidget):
                     "\n[Sugestões] — Nenhuma (execute varredura via interface primeiro)"
                 )
         except Exception:
+            logger.exception("Falha ao montar contexto: list_suggestions()")
             lines.append("\n[Sugestões] — Não disponível")
 
         # ── Duplicatas (resumo) ─────────────────────────────────────────────
@@ -419,6 +517,7 @@ class AssistantTab(QWidget):
                     "\n[Duplicatas] — Nenhuma detectada no índice (execute varredura primeiro)"
                 )
         except Exception:
+            logger.exception("Falha ao montar contexto: find_duplicates()")
             lines.append("\n[Duplicatas] — Não disponível")
 
         # ── Histórico recente ───────────────────────────────────────────────
@@ -436,6 +535,7 @@ class AssistantTab(QWidget):
             else:
                 lines.append("\n[Histórico] — Nenhuma operação registrada")
         except Exception:
+            logger.exception("Falha ao montar contexto: get_history()")
             lines.append("\n[Histórico] — Não disponível")
 
         lines += [
@@ -495,6 +595,11 @@ class AssistantTab(QWidget):
         self._current_response_text = ""
         tools = tb.get_tool_schemas()
 
+        # Sprint 7.5: defensivamente parar qualquer worker anterior antes de
+        # criar um novo. Em fluxo normal, _on_response_finished já fez cleanup,
+        # mas se o usuário spam-clicar antes da resposta, evita acúmulo de threads.
+        self._stop_active_worker(timeout_ms=WORKER_RESTART_TIMEOUT_MS)
+
         self._worker = OllamaAgentWorker(model, self._messages, tools, self)
         self._worker.tool_call_started.connect(self._on_tool_call_started)
         self._worker.tool_call_finished.connect(self._on_tool_call_finished)
@@ -529,6 +634,10 @@ class AssistantTab(QWidget):
         )
         self._scroll_to_bottom()
 
+        # Notificar MainWindow para atualizar aba Histórico quando tool executiva roda
+        if not is_error and tool_name in self._EXECUTIVE_TOOLS:
+            self.ai_action_executed.emit()
+
     def _on_agent_text(self, content: str):
         """Exibe o texto final do modelo."""
         self._current_response_text = content
@@ -554,22 +663,15 @@ class AssistantTab(QWidget):
             })
         self.chat_display.append("<br>")
 
+        # Sprint 7.5: limpar worker recém-finalizado. Como ele já emitiu
+        # finished_response, run() está prestes a retornar — wait() retorna
+        # quase imediatamente. Disconecta sinais e agenda deleteLater para
+        # liberar memória.
+        self._stop_active_worker(timeout_ms=self._WORKER_CLEANUP_TIMEOUT_MS)
+
         self.input_box.setEnabled(True)
         self.btn_send.setEnabled(True)
         self.input_box.setFocus()
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Helpers de chat simples (streaming, sem tools) — mantido para fallback
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _on_token(self, token: str):
-        """Recebe token de streaming do OllamaChatWorker (fallback)."""
-        self._current_response_text += token
-        cursor = self.chat_display.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        self.chat_display.setTextCursor(cursor)
-        self.chat_display.insertPlainText(token)
-        self._scroll_to_bottom()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Utilitários de UI

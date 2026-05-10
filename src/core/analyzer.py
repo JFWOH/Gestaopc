@@ -41,7 +41,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # Tamanho da amostra para hash parcial (1 MB).
-_SAMPLE_SIZE: int = 1024 * 1024  # 1 MB
+from src.core.config import HASH_FULL_CHUNK_SIZE, HASH_SAMPLE_SIZE
+
+# Sprint 7.6: alias backward-compat para testes que fazem patch deste nome.
+# O valor canônico vive em src/core/config.py.
+_SAMPLE_SIZE: int = HASH_SAMPLE_SIZE
 
 # Extensões de mídia pesada que devem sair do NVMe (Regra 1).
 _HEAVY_MEDIA_EXTENSIONS: set[str] = {
@@ -117,7 +121,12 @@ class DuplicateDetector:
         groups = detector.find_duplicates(list_of_file_entries)
     """
 
-    def find_duplicates(self, files: list[FileEntry]) -> list[DuplicateGroup]:
+    def find_duplicates(
+        self,
+        files: list[FileEntry],
+        *,
+        cache=None,  # HashCache | None — Sprint 7.4
+    ) -> list[DuplicateGroup]:
         """
         Encontra todas as duplicatas entre os arquivos fornecidos.
 
@@ -126,11 +135,20 @@ class DuplicateDetector:
         files:
             Lista de :class:`FileEntry` (normalmente produzida por
             ``StorageScanner.top_largest_files`` ou uma varredura completa).
+        cache:
+            Sprint 7.4 — instância opcional de :class:`HashCache`. Quando
+            fornecida, hashes parciais e completos são consultados antes de
+            recomputar o arquivo, e novos hashes são publicados de volta.
+            Default: ``NullHashCache`` (sem caching).
 
         Returns
         -------
         Lista de :class:`DuplicateGroup` contendo apenas grupos com ≥2 arquivos.
         """
+        if cache is None:
+            from src.core.hash_cache import NullHashCache
+            cache = NullHashCache()
+
         # ── Etapa 1: Agrupar por tamanho exato ──────────────────────────
         size_groups: dict[int, list[str]] = defaultdict(list)
         for f in files:
@@ -154,7 +172,12 @@ class DuplicateDetector:
         sample_groups: dict[str, list[str]] = defaultdict(list)
         for size, paths in candidates.items():
             for filepath in paths:
-                h = self._hash_sample(filepath)
+                # Sprint 7.4: tentar cache antes de recomputar
+                h = cache.get_partial(filepath)
+                if h is None:
+                    h = self._hash_sample(filepath)
+                    if h is not None:
+                        cache.put_partial(filepath, h)
                 if h is not None:
                     # Chave composta: tamanho + hash parcial
                     key = f"{size}:{h}"
@@ -178,7 +201,12 @@ class DuplicateDetector:
         for key, paths in sample_candidates.items():
             size = int(key.split(":")[0])
             for filepath in paths:
-                h = self._hash_full(filepath)
+                # Sprint 7.4: tentar cache antes de recomputar
+                h = cache.get_full(filepath)
+                if h is None:
+                    h = self._hash_full(filepath)
+                    if h is not None:
+                        cache.put_full(filepath, h)
                 if h is not None:
                     full_groups[h].append(filepath)
 
@@ -257,7 +285,7 @@ class DuplicateDetector:
             hasher = hashlib.sha256()
             with open(filepath, "rb") as f:
                 while True:
-                    chunk = f.read(8192)
+                    chunk = f.read(HASH_FULL_CHUNK_SIZE)
                     if not chunk:
                         break
                     hasher.update(chunk)

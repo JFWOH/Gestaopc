@@ -15,6 +15,45 @@ from src.core.scanner import FileEntry, PartitionInfo
 
 
 # ---------------------------------------------------------------------------
+# QApplication — fixture de sessão única (Sprint 7.3.1)
+# ---------------------------------------------------------------------------
+# PySide6 (e Qt em geral) só permite UMA instância de QCoreApplication-derived
+# por processo. Como temos arquivos de teste que precisam só de QCoreApplication
+# (log_bridge, workers_signals — sem widgets) e outros que precisam de
+# QApplication completa (scan_status_panel — com QFrame/QWidget), criar a
+# QCoreApplication primeiro impede que QApplication seja criada depois.
+#
+# A fixture session-scoped abaixo cria QApplication uma única vez (que É-UMA
+# QCoreApplication), atendendo ambos os casos. Os arquivos individuais que
+# tinham `qapp` local agora podem reusar esta — mas mantemos as deles para
+# não quebrar imports; a session-scoped é importada automaticamente pelo
+# pytest e garante que QApplication existe antes de qualquer teste rodar.
+
+@pytest.fixture(scope="session", autouse=True)
+def _qt_application():
+    """
+    Cria a QApplication na primeira invocação e a mantém viva pela sessão.
+
+    autouse=True garante que existe ANTES de qualquer fixture qapp local
+    tentar `QCoreApplication.instance() or QCoreApplication([])` — neste caso
+    instance() já retorna a QApplication, satisfazendo ambos os tipos.
+    """
+    try:
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        # PySide6 não instalado — pulamos silenciosamente. Testes Qt vão pular
+        # via pytest.importorskip("PySide6") nos arquivos individuais.
+        yield None
+        return
+
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+    yield app
+    # Não chamamos app.quit() — deixar o GC do Python encerrar limpa.
+
+
+# ---------------------------------------------------------------------------
 # Constantes de teste
 # ---------------------------------------------------------------------------
 

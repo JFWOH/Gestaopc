@@ -88,6 +88,7 @@ class FileEntry:
     path: str
     size_bytes: int
     category: str = "Outros"
+    modified_time: float = 0.0  # epoch seconds; 0.0 = desconhecido
 
     @property
     def size_mb(self) -> float:
@@ -230,7 +231,7 @@ class StorageScanner:
             for fname in filenames:
                 filepath = os.path.join(dirpath, fname)
                 try:
-                    size = os.path.getsize(filepath)
+                    st = os.stat(filepath)
                 except (PermissionError, OSError) as exc:
                     # Arquivo bloqueado pelo Kaspersky, BitLocker, ou SYSTEM.
                     logger.debug(
@@ -241,7 +242,12 @@ class StorageScanner:
                     continue
 
                 category = self._categorize(fname)
-                entries.append(FileEntry(path=filepath, size_bytes=size, category=category))
+                entries.append(FileEntry(
+                    path=filepath,
+                    size_bytes=st.st_size,
+                    category=category,
+                    modified_time=st.st_mtime,
+                ))
 
         # Ordenar do maior para o menor e retornar o top N.
         entries.sort(key=lambda e: e.size_bytes, reverse=True)

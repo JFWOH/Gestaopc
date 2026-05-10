@@ -23,6 +23,8 @@ Uso::
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import secrets
@@ -34,6 +36,11 @@ from typing import Any
 
 from src.core.scanner import StorageScanner
 from src.core.storage_db import StorageManagerDB, get_default_db_path
+from src.core.path_guard import (
+    PROTECTED_FILENAMES as _PG_PROTECTED_FILENAMES,
+    PROTECTED_PATH_PREFIXES as _PG_PROTECTED_PATH_PREFIXES,
+    validate_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,24 +48,12 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 # Segurança — caminhos e nomes de arquivo protegidos
 # ─────────────────────────────────────────────────────────────────────────────
+# Sprint 7.2: as constantes canônicas vivem em src/core/path_guard.py.
+# Mantemos re-exportações locais com tipos preservados (list/set) para
+# compatibilidade com testes/clientes que importam destes nomes.
 
-PROTECTED_PATH_PREFIXES: list[str] = [
-    "C:\\WINDOWS",
-    "C:\\PROGRAM FILES",
-    "C:\\PROGRAM FILES (X86)",
-    "C:\\PROGRAMDATA",
-    "C:\\SYSTEM VOLUME INFORMATION",
-    "C:\\$RECYCLE.BIN",
-]
-
-PROTECTED_FILENAMES: set[str] = {
-    "pagefile.sys",
-    "swapfile.sys",
-    "hiberfil.sys",
-    "ntldr",
-    "bootmgr",
-    "ntdetect.com",
-}
+PROTECTED_PATH_PREFIXES: list[str] = list(_PG_PROTECTED_PATH_PREFIXES)
+PROTECTED_FILENAMES: set[str] = set(_PG_PROTECTED_FILENAMES)
 
 VALID_DISK_ROLES: set[str] = {"primary", "media", "backup", "external", "none"}
 
@@ -70,9 +65,11 @@ EXECUTIVE_ACTIONS: set[str] = {
     "set_disk_role",
 }
 
-# Limites de execução
-_MAX_EXEC_PER_MINUTE: int = 3
-_TOKEN_TTL_SECONDS: int = 60
+# Limites de execução — Sprint 7.6: valores canônicos em src/core/config.py.
+from src.core.config import AI_MAX_EXEC_PER_MINUTE, AI_TOKEN_TTL_SECONDS
+
+_MAX_EXEC_PER_MINUTE: int = AI_MAX_EXEC_PER_MINUTE
+_TOKEN_TTL_SECONDS: int = AI_TOKEN_TTL_SECONDS
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -84,10 +81,39 @@ class _ConfirmationToken:
     token: str
     action: str
     args: dict
+    args_fingerprint: str  # Sprint 7.2: SHA-256 dos args para vincular o token
     expires_at: float
 
 
 _token_store: dict[str, _ConfirmationToken] = {}
+
+
+# Argumentos que fazem parte do "vínculo" do token. Outros (ai_source,
+# confirmation_token) NÃO entram no fingerprint para que a chamada possa
+# adicioná-los livremente.
+_FINGERPRINT_EXCLUDE: frozenset[str] = frozenset({
+    "confirmation_token", "ai_source",
+})
+
+
+def _fingerprint_args(args: dict) -> str:
+    """
+    Calcula impressão SHA-256 estável dos argumentos relevantes de uma ação.
+
+    Sprint 7.2 (S-2): vincula o token ao conjunto exato de argumentos passado
+    em request_confirmation. Tentar reusar o token com paths/IDs diferentes
+    resulta em TOKEN_ARGS_MISMATCH.
+
+    Os campos `confirmation_token` e `ai_source` são excluídos do hash, pois
+    não fazem parte da intenção da ação confirmada.
+    """
+    if not isinstance(args, dict):
+        args = {}
+    filtered = {
+        k: v for k, v in args.items() if k not in _FINGERPRINT_EXCLUDE
+    }
+    canonical = json.dumps(filtered, sort_keys=True, default=str, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _clean_expired_tokens() -> None:
@@ -140,20 +166,72 @@ def _human_size(size_bytes: int) -> str:
 
 
 def _is_protected(path: str) -> bool:
-    """Retorna True se o caminho ou nome do arquivo é protegido pelo SO."""
-    p = Path(path)
-    if p.name.lower() in PROTECTED_FILENAMES:
-        return True
-    path_upper = str(p.resolve()).upper()
-    return any(path_upper.startswith(prefix) for prefix in PROTECTED_PATH_PREFIXES)
+    """
+    Retorna True se o caminho é inválido ou aponta para área protegida do SO.
+
+    Sprint 7.2 (S-1): delega a `path_guard.validate_path`, que faz validação
+    completa: caminho não vazio, absoluto, resolução canônica (símlinks),
+    diretórios protegidos (Windows, Program Files, ProgramData, Recovery,
+    Boot, etc.) e nomes de arquivo de sistema (pagefile.sys, etc.).
+
+    Mantida por compatibilidade com testes; a maior parte do código deve
+    usar `_assert_safe()` que retorna dict de erro estruturado.
+    """
+    ok, _err = validate_path(path)
+    return not ok
 
 
-def _validate_token(token: str, action: str) -> dict | None:
+def _assert_safe(path: str | None, role: str = "caminho") -> dict | None:
+    """
+    Sprint 7.2: gate uniforme para todas as tools executivas.
+
+    Retorna dict de erro padronizado se o caminho é inválido/protegido,
+    ou None se for seguro. Encapsula a chamada a `path_guard.validate_path`
+    para que a mensagem ao agente IA seja consistente.
+
+    Args:
+        path: caminho a validar. None ou string vazia produzem erro.
+        role: descrição amigável (ex.: "origem", "destino") usada na mensagem.
+    """
+    if not path:
+        return {
+            "error": "PROTECTED_PATH",
+            "message": f"Operação negada — {role} não informado.",
+        }
+    ok, err = validate_path(path)
+    if not ok:
+        # Não vazamos o err completo (que pode conter o caminho inteiro)
+        # para clientes externos; basta a categoria.
+        logger.warning("Path guard rejeitou %s='%s': %s", role, path, err)
+        return {
+            "error": "PROTECTED_PATH",
+            "message": (
+                f"Operação negada — {role} é inválido ou parte do "
+                f"sistema operacional protegido."
+            ),
+        }
+    return None
+
+
+def _validate_token(
+    token: str,
+    action: str,
+    call_args: dict | None = None,
+) -> dict | None:
     """
     Valida token one-shot para uma ação executiva.
 
-    Retorna None se válido e consume o token.
-    Retorna dict de erro se inválido, expirado ou incompatível.
+    Retorna None se válido (e consome o token).
+    Retorna dict de erro se inválido, expirado, com ação errada ou
+    com argumentos divergentes do que foi confirmado.
+
+    Sprint 7.2 (S-2): se `call_args` for fornecido, exige que seu fingerprint
+    SHA-256 bata com o armazenado em `request_confirmation`. Isso impede
+    ataques de "token reuse com paths diferentes".
+
+    Para compatibilidade com testes legados, `call_args=None` mantém o
+    comportamento antigo (sem checagem de args) — APIs de produção devem
+    sempre passar `call_args`.
     """
     ct = _token_store.get(token)
     if ct is None:
@@ -174,6 +252,25 @@ def _validate_token(token: str, action: str) -> dict | None:
             "error": "TOKEN_MISMATCH",
             "message": f"Token emitido para '{ct.action}', não para '{action}'.",
         }
+    if call_args is not None:
+        actual_fp = _fingerprint_args(call_args)
+        if actual_fp != ct.args_fingerprint:
+            # Não consumimos o token aqui — deixamos a IA tentar de novo
+            # com argumentos corretos. Mas log a tentativa.
+            logger.warning(
+                "Token args mismatch para action=%s. Confirmado=%s, chamado=%s",
+                action,
+                sorted(ct.args.keys()),
+                sorted(call_args.keys()),
+            )
+            return {
+                "error": "TOKEN_ARGS_MISMATCH",
+                "message": (
+                    "Token foi emitido para argumentos diferentes dos passados "
+                    "agora. Solicite um novo token via request_confirmation com "
+                    "os argumentos exatos da chamada."
+                ),
+            }
     del _token_store[token]  # one-shot: consumir após validação
     return None
 
@@ -498,6 +595,7 @@ def request_confirmation(action: str, args: dict) -> dict:
         token=token,
         action=action,
         args=args,
+        args_fingerprint=_fingerprint_args(args or {}),
         expires_at=expires_at,
     )
 
@@ -554,15 +652,14 @@ def move_to_trash(
         confirmation_token: Token obtido via request_confirmation.
         ai_source: Origem da chamada — 'ai:ollama' ou 'ai:mcp'.
     """
-    if err := _validate_token(confirmation_token, "move_to_trash"):
+    if err := _validate_token(
+        confirmation_token, "move_to_trash", {"path": path}
+    ):
         return err
     if err := _check_rate_limit():
         return err
-    if _is_protected(path):
-        return {
-            "error": "PROTECTED_PATH",
-            "message": "Operação negada — caminho é parte do sistema operacional.",
-        }
+    if err := _assert_safe(path, role="caminho"):
+        return err
 
     p = Path(path)
     if not p.exists():
@@ -618,15 +715,19 @@ def move_file(
         confirmation_token: Token obtido via request_confirmation.
         ai_source: Origem da chamada — 'ai:ollama' ou 'ai:mcp'.
     """
-    if err := _validate_token(confirmation_token, "move_file"):
+    if err := _validate_token(
+        confirmation_token,
+        "move_file",
+        {"source_path": source_path, "target_path": target_path},
+    ):
         return err
     if err := _check_rate_limit():
         return err
-    if _is_protected(source_path):
-        return {
-            "error": "PROTECTED_PATH",
-            "message": "Operação negada — arquivo de origem é parte do sistema operacional.",
-        }
+    # Sprint 7.2 (S-1, S-4): validar AMBOS origem e destino antes de qualquer I/O.
+    if err := _assert_safe(source_path, role="origem"):
+        return err
+    if err := _assert_safe(target_path, role="destino"):
+        return err
 
     src = Path(source_path)
     if not src.exists():
@@ -687,7 +788,9 @@ def apply_suggestion(
         confirmation_token: Token obtido via request_confirmation.
         ai_source: Origem da chamada — 'ai:ollama' ou 'ai:mcp'.
     """
-    if err := _validate_token(confirmation_token, "apply_suggestion"):
+    if err := _validate_token(
+        confirmation_token, "apply_suggestion", {"suggestion_id": suggestion_id}
+    ):
         return err
     if err := _check_rate_limit():
         return err
@@ -709,11 +812,9 @@ def apply_suggestion(
         target_disk = row["target_disk"] or ""
         rule_id = row["rule_id"]
 
-        if _is_protected(file_path):
-            return {
-                "error": "PROTECTED_PATH",
-                "message": "Operação negada — arquivo é parte do sistema operacional.",
-            }
+        # Sprint 7.2 (S-1): validar caminho de origem antes de qualquer ação.
+        if err := _assert_safe(file_path, role="arquivo da sugestão"):
+            return err
 
         p = Path(file_path)
         if not p.exists():
@@ -754,6 +855,10 @@ def apply_suggestion(
                     "message": "Sugestão não possui disco de destino definido.",
                 }
             target_path = str(Path(target_disk + "\\") / p.name)
+            # Sprint 7.2 (S-4): validar destino montado — uma sugestão maliciosa
+            # no DB poderia trazer target_disk apontando para C:\Windows etc.
+            if err := _assert_safe(target_path, role="destino da sugestão"):
+                return err
             dst = Path(target_path)
             dst.parent.mkdir(parents=True, exist_ok=True)
             if dst.exists():
@@ -808,7 +913,11 @@ def undo_last_operation(
         operation_id: ID específico da operação (padrão: última MOVER bem-sucedida).
         ai_source: Origem da chamada — 'ai:ollama' ou 'ai:mcp'.
     """
-    if err := _validate_token(confirmation_token, "undo_last_operation"):
+    if err := _validate_token(
+        confirmation_token,
+        "undo_last_operation",
+        {"operation_id": operation_id},
+    ):
         return err
     if err := _check_rate_limit():
         return err
@@ -836,6 +945,13 @@ def undo_last_operation(
 
         if not current_path:
             return {"error": "NO_TARGET", "message": "Operação não possui caminho de destino registrado."}
+
+        # Sprint 7.2 (S-1): validar AMBOS os caminhos lidos do DB. Se o histórico
+        # foi adulterado (ex.: edição direta do SQLite), não fazemos undo cego.
+        if err := _assert_safe(current_path, role="arquivo a restaurar"):
+            return err
+        if err := _assert_safe(restore_path, role="destino do undo"):
+            return err
 
         if not Path(current_path).exists():
             return {
@@ -886,7 +1002,11 @@ def set_disk_role(
         confirmation_token: Token obtido via request_confirmation.
         ai_source: Origem da chamada — 'ai:ollama' ou 'ai:mcp'.
     """
-    if err := _validate_token(confirmation_token, "set_disk_role"):
+    if err := _validate_token(
+        confirmation_token,
+        "set_disk_role",
+        {"drive_letter": drive_letter, "role": role},
+    ):
         return err
     if err := _check_rate_limit():
         return err

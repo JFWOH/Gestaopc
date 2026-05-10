@@ -616,3 +616,134 @@ def test_get_default_db_path_returns_path():
     assert isinstance(p, type(p))  # Path
     assert p.suffix == ".db"
     assert "GestaoPC" in str(p) or ".gestaopc" in str(p)
+
+
+# ===========================================================================
+# Sprint 7.4 — get_file_index_batch + update_file_hashes_batch
+# ===========================================================================
+
+class TestGetFileIndexBatch:
+    """Lookup em lote para o cache de hash."""
+
+    def _seed_files(self, db, paths_with_size):
+        # upsert_file_index gerencia sua própria transação — não usar `with db:`
+        # aqui pois isso fecha a conexão do context manager externo.
+        for path, size in paths_with_size:
+            db.upsert_file_index(
+                path=path,
+                disk_letter=path[:2] if len(path) >= 2 else None,
+                size_bytes=size,
+                mtime=1000.0,
+                last_seen=2000.0,
+            )
+
+    def test_empty_paths_returns_empty_dict(self, tmp_path):
+        with StorageManagerDB(tmp_path / "t.db") as db:
+            result = db.get_file_index_batch([])
+        assert result == {}
+
+    def test_single_path_lookup(self, tmp_path):
+        with StorageManagerDB(tmp_path / "t.db") as db:
+            self._seed_files(db, [("C:\\a.bin", 1000)])
+            result = db.get_file_index_batch(["C:\\a.bin"])
+        assert "C:\\a.bin" in result
+        assert result["C:\\a.bin"]["size_bytes"] == 1000
+
+    def test_multi_path_lookup(self, tmp_path):
+        with StorageManagerDB(tmp_path / "t.db") as db:
+            self._seed_files(db, [
+                ("C:\\a.bin", 100),
+                ("D:\\b.bin", 200),
+                ("E:\\c.bin", 300),
+            ])
+            result = db.get_file_index_batch(
+                ["C:\\a.bin", "D:\\b.bin", "E:\\c.bin"]
+            )
+        assert len(result) == 3
+        assert result["C:\\a.bin"]["size_bytes"] == 100
+        assert result["E:\\c.bin"]["size_bytes"] == 300
+
+    def test_missing_paths_silently_omitted(self, tmp_path):
+        with StorageManagerDB(tmp_path / "t.db") as db:
+            self._seed_files(db, [("C:\\exists.bin", 100)])
+            result = db.get_file_index_batch(
+                ["C:\\exists.bin", "C:\\nope.bin"]
+            )
+        assert "C:\\exists.bin" in result
+        assert "C:\\nope.bin" not in result
+
+    def test_chunks_above_500_paths(self, tmp_path):
+        """SQLite limita 999 placeholders; nosso chunking usa 500."""
+        with StorageManagerDB(tmp_path / "t.db") as db:
+            paths = [(f"C:\\file_{i}.bin", i * 10) for i in range(1500)]
+            self._seed_files(db, paths)
+            result = db.get_file_index_batch([p for p, _ in paths])
+        assert len(result) == 1500
+
+
+class TestUpdateFileHashesBatch:
+    """Persistência em lote dos hashes recém-computados."""
+
+    def test_empty_updates_returns_zero(self, tmp_path):
+        with StorageManagerDB(tmp_path / "t.db") as db:
+            assert db.update_file_hashes_batch([]) == 0
+
+    def test_updates_partial_only(self, tmp_path):
+        with StorageManagerDB(tmp_path / "t.db") as db:
+            db.upsert_file_index(
+                path="C:\\a.bin", disk_letter="C:", size_bytes=100,
+                mtime=1.0, last_seen=2.0,
+            )
+            affected = db.update_file_hashes_batch(
+                [("C:\\a.bin", "partial_h", None)]
+            )
+            assert affected == 1
+            row = db.get_file_index("C:\\a.bin")
+            assert row["partial_hash"] == "partial_h"
+            assert row["full_hash"] is None  # Não tocou
+
+    def test_updates_full_only_preserves_existing_partial(self, tmp_path):
+        with StorageManagerDB(tmp_path / "t.db") as db:
+            db.upsert_file_index(
+                path="C:\\a.bin", disk_letter="C:", size_bytes=100,
+                mtime=1.0, partial_hash="ph_existing", last_seen=2.0,
+            )
+            db.update_file_hashes_batch([("C:\\a.bin", None, "fh_new")])
+            row = db.get_file_index("C:\\a.bin")
+            assert row["partial_hash"] == "ph_existing", "Não deve ter sido apagado"
+            assert row["full_hash"] == "fh_new"
+
+    def test_updates_both_in_one_call(self, tmp_path):
+        with StorageManagerDB(tmp_path / "t.db") as db:
+            db.upsert_file_index(
+                path="C:\\a.bin", disk_letter="C:", size_bytes=100,
+                mtime=1.0, last_seen=2.0,
+            )
+            db.update_file_hashes_batch([("C:\\a.bin", "p", "f")])
+            row = db.get_file_index("C:\\a.bin")
+            assert row["partial_hash"] == "p"
+            assert row["full_hash"] == "f"
+
+    def test_missing_path_silently_skipped(self, tmp_path):
+        """UPDATE em path inexistente afeta 0 linhas, sem crash."""
+        with StorageManagerDB(tmp_path / "t.db") as db:
+            affected = db.update_file_hashes_batch(
+                [("C:\\never_inserted.bin", "p", "f")]
+            )
+            assert affected == 0
+
+    def test_skips_entries_with_both_hashes_none(self, tmp_path):
+        """Entry com partial=None e full=None não gera UPDATE."""
+        with StorageManagerDB(tmp_path / "t.db") as db:
+            db.upsert_file_index(
+                path="C:\\a.bin", disk_letter="C:", size_bytes=100,
+                mtime=1.0, partial_hash="keep", full_hash="keep_too",
+                last_seen=2.0,
+            )
+            affected = db.update_file_hashes_batch(
+                [("C:\\a.bin", None, None)]
+            )
+            assert affected == 0
+            row = db.get_file_index("C:\\a.bin")
+            assert row["partial_hash"] == "keep"
+            assert row["full_hash"] == "keep_too"

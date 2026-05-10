@@ -270,3 +270,145 @@ class TestFileAction:
         a = FileAction(action="DELETAR", source_path="C:\\file.txt")
         assert a.action == "DELETAR"
         assert a.target_path == ""
+
+
+# ---------------------------------------------------------------------------
+# Sprint 6 — Hardening: path guard integration
+# ---------------------------------------------------------------------------
+
+class TestPathGuardInExecutor:
+    """Garante que executor.py rejeita caminhos inválidos antes de tocar no disco."""
+
+    def test_move_rejects_relative_source(self, tmp_path: Path):
+        executor = SafeFileExecutor()
+        record = executor.move_file("relative/path.txt", str(tmp_path / "dest.txt"))
+        assert record.success is False
+        assert "relativo" in record.error.lower() or "invalid" in record.error.lower() or "inválido" in record.error.lower()
+
+    def test_move_rejects_relative_destination(self, tmp_path: Path):
+        src = tmp_path / "file.txt"
+        src.write_bytes(b"data")
+        executor = SafeFileExecutor()
+        record = executor.move_file(str(src), "relative/dest.txt")
+        assert record.success is False
+        assert record.error
+
+    def test_move_rejects_protected_source(self, tmp_path: Path):
+        executor = SafeFileExecutor()
+        record = executor.move_file(
+            "C:\\Windows\\System32\\kernel32.dll",
+            str(tmp_path / "kernel32.dll"),
+        )
+        assert record.success is False
+        assert record.error
+
+    def test_move_rejects_protected_destination(self, tmp_path: Path):
+        src = tmp_path / "file.txt"
+        src.write_bytes(b"data")
+        executor = SafeFileExecutor()
+        record = executor.move_file(str(src), "C:\\Windows\\malware.exe")
+        assert record.success is False
+        assert record.error
+
+    def test_delete_rejects_relative_path(self):
+        executor = SafeFileExecutor()
+        record = executor.delete_file("relative/path.txt")
+        assert record.success is False
+        assert record.error
+
+    def test_delete_rejects_protected_file(self):
+        executor = SafeFileExecutor()
+        record = executor.delete_file("C:\\Windows\\System32\\ntdll.dll")
+        assert record.success is False
+        assert record.error
+
+    def test_invalid_path_appended_to_history(self):
+        """Mesmo ao rejeitar, o record deve ser adicionado ao histórico."""
+        executor = SafeFileExecutor()
+        executor.delete_file("relative/path.txt")
+        assert len(executor.history) == 1
+        assert executor.history[0].success is False
+
+
+# ---------------------------------------------------------------------------
+# Sprint 6 — Hardening: batch size cap
+# ---------------------------------------------------------------------------
+
+class TestBatchSizeCap:
+    """Garante a constante e a lógica de rejeição de batch excessivo."""
+
+    def test_max_batch_size_constant_exists(self):
+        from src.core.executor import MAX_BATCH_SIZE
+        assert isinstance(MAX_BATCH_SIZE, int)
+        assert MAX_BATCH_SIZE >= 10, "Limite de batch deve ser pelo menos 10"
+        assert MAX_BATCH_SIZE <= 500, "Limite de batch deve ser razoável (≤ 500)"
+
+    def test_max_batch_size_is_50(self):
+        from src.core.executor import MAX_BATCH_SIZE
+        assert MAX_BATCH_SIZE == 50
+
+    def test_worker_constructor_stores_actions(self, tmp_path: Path):
+        """FileActionWorker armazena as ações corretamente."""
+        from src.core.executor import FileActionWorker, MAX_BATCH_SIZE
+        actions = [
+            FileAction(action="DELETAR", source_path=str(tmp_path / f"f{i}.txt"))
+            for i in range(3)
+        ]
+        worker = FileActionWorker(actions)
+        # Verificar que as ações foram armazenadas (acesso ao atributo interno)
+        assert len(worker._actions) == 3
+
+    def test_oversized_batch_produces_failure_records(self, tmp_path: Path):
+        """
+        Simula a lógica de rejeição sem rodar o QThread.
+
+        Verifica que n > MAX_BATCH_SIZE ações geram n OperationRecords de falha.
+        Abordagem: instanciar o worker e chamar run() diretamente em mock.
+        """
+        from src.core.executor import FileActionWorker, MAX_BATCH_SIZE
+        import time as _time
+
+        n = MAX_BATCH_SIZE + 1
+        actions = [
+            FileAction(action="DELETAR", source_path=str(tmp_path / f"f{i}.txt"))
+            for i in range(n)
+        ]
+
+        # Interceptar o sinal finished_all via monkey-patch
+        collected: list = []
+
+        worker = FileActionWorker(actions)
+        # Substituir emissão do sinal por coleta direta para evitar QApplication
+        worker.finished_all = type(
+            "_FakeSignal", (), {
+                "emit": staticmethod(lambda results: collected.extend(results)),
+                "connect": staticmethod(lambda *a: None),
+            }
+        )()
+        worker.progress = type(
+            "_FakeSignal", (), {
+                "emit": staticmethod(lambda *a: None),
+                "connect": staticmethod(lambda *a: None),
+            }
+        )()
+        worker.progress_percent = type(
+            "_FakeSignal", (), {
+                "emit": staticmethod(lambda *a: None),
+                "connect": staticmethod(lambda *a: None),
+            }
+        )()
+        worker.action_completed = type(
+            "_FakeSignal", (), {
+                "emit": staticmethod(lambda *a: None),
+                "connect": staticmethod(lambda *a: None),
+            }
+        )()
+
+        worker.run()  # chamada direta sem thread
+
+        assert len(collected) == n
+        assert all(not r.success for r in collected)
+        assert all(
+            "limite" in r.error.lower() or "batch" in r.error.lower()
+            for r in collected
+        )

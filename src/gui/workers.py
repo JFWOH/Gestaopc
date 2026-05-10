@@ -12,7 +12,7 @@ import os
 import time
 from dataclasses import dataclass, field
 
-from PyQt6.QtCore import QThread, pyqtSignal
+from PySide6.QtCore import QThread, Signal
 
 from src.core.scanner import StorageScanner, FileEntry, PartitionInfo, DirEntry
 from src.core.analyzer import (
@@ -22,6 +22,14 @@ from src.core.analyzer import (
     ReallocationSuggestion,
 )
 from src.core.storage_db import StorageManagerDB, get_default_db_path
+from src.core.hash_cache import InMemoryHashCache
+from src.core.config import (
+    HASH_CACHE_MTIME_TOLERANCE,
+    SCAN_DIR_MAX_DEPTH,
+    SCAN_MIN_PARTITION_BYTES,
+    SCAN_TOP_DIRS_PER_DISK,
+    SCAN_TOP_FILES_PER_DISK,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,13 +68,22 @@ class FullScanWorker(QThread):
         Mensagem de status intermediário para a barra de status.
     progress_percent(int)
         Porcentagem de progresso (0–100).
+    progress_indeterminate(bool)
+        True → operação longa sem progresso mensurável (spinner busy).
+        False → retomar barra determinística normal.
     finished_result(ScanResult)
         Emitido quando a varredura termina (sucesso ou erro).
     """
 
-    progress = pyqtSignal(str)
-    progress_percent = pyqtSignal(int)
-    finished_result = pyqtSignal(object)  # ScanResult
+    progress = Signal(str)
+    progress_percent = Signal(int)
+    progress_indeterminate = Signal(bool)
+    finished_result = Signal(object)  # ScanResult
+
+    # Sprint 7.1 — Painel de status por disco
+    partitions_detected = Signal(list)         # list[PartitionInfo] varredores
+    disk_state_changed = Signal(str, str, str) # letter, status, stage_label
+    global_stage_changed = Signal(str)         # estágio não-per-disk
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -93,7 +110,9 @@ class FullScanWorker(QThread):
             scanner = StorageScanner()
 
             # ── Etapa 1: Mapear partições ───────────────────────────
-            self.progress.emit("Mapeando particoes...")
+            map_msg = "Mapeando particoes..."
+            self.progress.emit(map_msg)
+            self.global_stage_changed.emit(map_msg)
             self.progress_percent.emit(5)
             result.partitions = scanner.list_partitions()
             logger.info("Particoes mapeadas: %d", len(result.partitions))
@@ -101,94 +120,155 @@ class FullScanWorker(QThread):
             if self._abort:
                 return
 
-            # ── Etapa 2: Varrer maiores arquivos de cada disco ──────
-            self.progress.emit("Varrendo discos (maiores arquivos)...")
+            # ── Etapa 2: Varrer maiores arquivos+pastas por disco ───
+            # Sprint 7.1: combinamos as duas passagens (files + dirs) em
+            # um único loop por disco para que o painel de status mostre
+            # cada disco progredindo de pendente → em curso → concluído.
+            self.progress.emit("Varrendo discos...")
             self.progress_percent.emit(10)
 
             all_files: list[FileEntry] = []
+            all_dirs: list[DirEntry] = []
             scannable = [
                 p for p in result.partitions
-                if p.total_bytes > 1024 * 1024 * 100  # Ignorar partições minúsculas (<100MB)
+                if p.total_bytes > SCAN_MIN_PARTITION_BYTES
             ]
+
+            # Inicializa o painel com todos os discos no estado "pending".
+            self.partitions_detected.emit(scannable)
+            for part in scannable:
+                self.disk_state_changed.emit(part.letter, "pending", "")
 
             for idx, part in enumerate(scannable):
                 if self._abort:
                     return
 
-                pct = 10 + int((idx / max(len(scannable), 1)) * 50)
-                self.progress.emit(f"Varrendo {part.letter} ({idx+1}/{len(scannable)})...")
-                self.progress_percent.emit(pct)
+                pct_start = 10 + int((idx / max(len(scannable), 1)) * 55)
+                self.progress.emit(
+                    f"Varrendo {part.letter} ({idx+1}/{len(scannable)})..."
+                )
+                self.progress_percent.emit(pct_start)
 
+                # ── Sub-etapa 2.a: maiores arquivos do disco ───────
+                self.disk_state_changed.emit(
+                    part.letter, "scanning", "Analisando arquivos…"
+                )
+                disk_had_error = False
                 try:
-                    # Estratégia otimizada: varrer subdiretórios prioritários
-                    # em vez de os.walk na raiz inteira (que leva horas em discos de TB).
                     scan_targets = self._get_scan_targets(part.letter)
                     for target in scan_targets:
                         if self._abort:
                             return
                         try:
-                            files = scanner.top_largest_files(target, n=50)
+                            files = scanner.top_largest_files(
+                                target, n=SCAN_TOP_FILES_PER_DISK,
+                            )
                             all_files.extend(files)
                         except Exception as exc:
                             logger.debug("Erro em subdir %s: %s", target, exc)
                 except Exception as exc:
+                    disk_had_error = True
                     logger.warning(
-                        "Erro ao varrer %s: %s — continuando.", part.letter, exc
+                        "Erro ao varrer arquivos de %s: %s — continuando.",
+                        part.letter, exc,
                     )
 
-            # Consolidar top 50 global de todos os discos.
-            all_files.sort(key=lambda f: f.size_bytes, reverse=True)
-            result.top_files = all_files[:50]
-            
-            total_files = len(all_files)
-            total_bytes = sum(f.size_bytes for f in all_files)
-            
-            logger.info("Top files global: %d entradas.", len(result.top_files))
-
-            if self._abort:
-                return
-
-            # ── Etapa 2.5: Top pastas consumidoras ───────────────────
-            self.progress.emit("Analisando pastas mais pesadas...")
-            self.progress_percent.emit(62)
-
-            all_dirs: list[DirEntry] = []
-            for idx, part in enumerate(scannable):
                 if self._abort:
                     return
+
+                # ── Sub-etapa 2.b: maiores pastas do disco ─────────
+                self.disk_state_changed.emit(
+                    part.letter, "scanning", "Analisando pastas…"
+                )
                 try:
                     scan_targets = self._get_scan_targets(part.letter)
                     for target in scan_targets:
                         if self._abort:
                             return
                         try:
-                            dirs = scanner.top_largest_dirs(target, n=20, max_depth=2)
+                            dirs = scanner.top_largest_dirs(
+                                target,
+                                n=SCAN_TOP_DIRS_PER_DISK,
+                                max_depth=SCAN_DIR_MAX_DEPTH,
+                            )
                             all_dirs.extend(dirs)
                         except Exception as exc:
-                            logger.debug("Erro ao listar dirs de %s: %s", target, exc)
+                            logger.debug(
+                                "Erro ao listar dirs de %s: %s", target, exc
+                            )
                 except Exception as exc:
-                    logger.debug("Erro ao analisar pastas de %s: %s", part.letter, exc)
+                    disk_had_error = True
+                    logger.debug(
+                        "Erro ao analisar pastas de %s: %s", part.letter, exc
+                    )
+
+                # Marcar disco como concluído (ou falhou) antes do próximo
+                final_state = "error" if disk_had_error else "done"
+                self.disk_state_changed.emit(part.letter, final_state, "")
+
+            # Consolidar top global de todos os discos.
+            all_files.sort(key=lambda f: f.size_bytes, reverse=True)
+            result.top_files = all_files[:SCAN_TOP_FILES_PER_DISK]
+
+            total_files = len(all_files)
+            total_bytes = sum(f.size_bytes for f in all_files)
+
+            logger.info("Top files global: %d entradas.", len(result.top_files))
 
             all_dirs.sort(key=lambda d: d.total_size_bytes, reverse=True)
-            result.top_dirs = all_dirs[:20]
+            result.top_dirs = all_dirs[:SCAN_TOP_DIRS_PER_DISK]
             logger.info("Top dirs global: %d entradas.", len(result.top_dirs))
 
             if self._abort:
                 return
 
             # ── Etapa 3: Detectar duplicatas ────────────────────────
-            self.progress.emit("Analisando duplicatas...")
+            # Esta etapa pode rodar 5–15 minutos em discos grandes (hash SHA-256
+            # completo). A barra de progresso entra em modo indeterminado para
+            # comunicar atividade sem sugerir tempo restante mensurável.
+            dup_msg = (
+                "Comparando duplicatas (hash SHA-256, pode demorar varios minutos)..."
+            )
+            self.progress.emit(dup_msg)
+            self.global_stage_changed.emit(dup_msg)
             self.progress_percent.emit(65)
+            self.progress_indeterminate.emit(True)
+
+            # Sprint 7.4: hidratar cache de hash a partir do DB. Arquivos cujo
+            # path JÁ está em file_index com size/mtime idênticos podem reusar
+            # os hashes computados em scans anteriores, transformando re-scans
+            # de 13+ minutos em segundos.
+            hash_cache = self._build_hash_cache(all_files, db)
+            logger.info(
+                "Hash cache hidratado: %d hashes parciais e %d hashes completos.",
+                hash_cache.partial_count,
+                hash_cache.full_count,
+            )
 
             detector = DuplicateDetector()
-            result.duplicates = detector.find_duplicates(all_files)
-            logger.info("Duplicatas: %d grupos.", len(result.duplicates))
+            try:
+                result.duplicates = detector.find_duplicates(
+                    all_files, cache=hash_cache,
+                )
+            finally:
+                # Sempre retornar para modo determinístico, mesmo se find_duplicates
+                # lançar exceção (ela será capturada pelo except externo).
+                self.progress_indeterminate.emit(False)
+            logger.info(
+                "Duplicatas: %d grupos. Cache: %d hits parciais, %d novos parciais; "
+                "%d hits completos, %d novos completos.",
+                len(result.duplicates),
+                hash_cache.partial_hits, len(hash_cache.partial_writes),
+                hash_cache.full_hits, len(hash_cache.full_writes),
+            )
 
             if self._abort:
                 return
 
             # ── Etapa 4: Motor de regras ────────────────────────────
-            self.progress.emit("Avaliando regras de realocacao...")
+            rules_msg = "Avaliando regras de realocacao..."
+            self.progress.emit(rules_msg)
+            self.global_stage_changed.emit(rules_msg)
             self.progress_percent.emit(85)
 
             engine = SmartRulesEngine()
@@ -213,6 +293,10 @@ class FullScanWorker(QThread):
                     created_at=time.time()
                 )
             
+            # Sprint 7.4: persistir top_files COM os hashes do cache. Em re-scans,
+            # os hashes vêm seedados do DB e voltam intactos; em arquivos novos
+            # ou modificados, vêm computados na Etapa 3.
+            now = time.time()
             for f in result.top_files:
                 drive_letter = f.path[:2] if len(f.path) >= 2 and f.path[1] == ':' else None
                 db.upsert_file_index(
@@ -221,13 +305,16 @@ class FullScanWorker(QThread):
                     size_bytes=f.size_bytes,
                     mtime=f.modified_time,
                     category=f.category,
-                    last_seen=time.time()
+                    partial_hash=hash_cache.get_partial(f.path),
+                    full_hash=hash_cache.get_full(f.path),
+                    last_seen=now,
                 )
                 
             logger.info("Sugestoes geradas: %d.", len(result.suggestions))
 
             self.progress_percent.emit(100)
             self.progress.emit("Varredura concluida!")
+            self.global_stage_changed.emit("")  # limpa estágio global no painel
 
         except Exception as exc:
             logger.exception("Erro fatal durante a varredura.")
@@ -249,6 +336,58 @@ class FullScanWorker(QThread):
             self.finished_result.emit(result)
 
     # ---- Helpers ────────────────────────────────────────────────────────
+
+    # Tolerância em segundos ao comparar mtime do filesystem com o cacheado.
+    # Sprint 7.6: valor canônico em config.HASH_CACHE_MTIME_TOLERANCE.
+    _MTIME_TOLERANCE_SECONDS: float = HASH_CACHE_MTIME_TOLERANCE
+
+    @classmethod
+    def _build_hash_cache(
+        cls, files: list[FileEntry], db: StorageManagerDB,
+    ) -> InMemoryHashCache:
+        """
+        Sprint 7.4: monta um InMemoryHashCache pré-populado com hashes do DB
+        cujos size_bytes e mtime ainda batem com o estado atual do filesystem.
+
+        Retorna o cache pronto para passar a `DuplicateDetector.find_duplicates`.
+        Hashes obsoletos (size ou mtime mudaram) são silenciosamente descartados;
+        os novos serão computados durante a varredura e re-persistidos depois.
+        """
+        cache = InMemoryHashCache()
+        if not files:
+            return cache
+        try:
+            paths = [f.path for f in files]
+            rows = db.get_file_index_batch(paths)
+        except Exception as exc:
+            # Falha do cache não deve bloquear a varredura — segue sem cache.
+            logger.warning("Falha ao hidratar cache de hash do DB: %s", exc)
+            return cache
+
+        stale = 0
+        for f in files:
+            row = rows.get(f.path)
+            if row is None:
+                continue
+            # Validar staleness: tamanho e mtime devem bater
+            if row["size_bytes"] != f.size_bytes:
+                stale += 1
+                continue
+            if abs(row["mtime"] - f.modified_time) > cls._MTIME_TOLERANCE_SECONDS:
+                stale += 1
+                continue
+            # Hashes válidos vão para o cache como seed (não-write)
+            if row["partial_hash"]:
+                cache.seed_partial(f.path, row["partial_hash"])
+            if row["full_hash"]:
+                cache.seed_full(f.path, row["full_hash"])
+
+        if stale:
+            logger.info(
+                "Hash cache: %d entradas obsoletas (size/mtime mudaram) descartadas.",
+                stale,
+            )
+        return cache
 
     @staticmethod
     def _get_scan_targets(drive_letter: str) -> list[str]:

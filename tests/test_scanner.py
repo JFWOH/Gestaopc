@@ -18,6 +18,7 @@ import pytest
 
 from src.core.scanner import (
     StorageScanner,
+    DirEntry,
     FileEntry,
     PartitionInfo,
     FILE_CATEGORIES,
@@ -143,24 +144,40 @@ class TestTopLargestFiles:
         """Arquivos inacessíveis devem ser pulados sem crash."""
         scanner = StorageScanner()
         (tmp_path / "ok.txt").write_bytes(b"acessivel\n")
-
-        # Mock os.path.getsize para lançar PermissionError em 1 arquivo
-        original_getsize = os.path.getsize
-
-        def patched_getsize(path):
-            if "blocked" in str(path):
-                raise PermissionError("Bloqueado pelo AV")
-            return original_getsize(path)
-
         (tmp_path / "blocked.dat").write_bytes(b"\x00" * 100)
 
-        with patch("os.path.getsize", side_effect=patched_getsize):
+        # Mock os.stat para lançar PermissionError em arquivos com "blocked"
+        # (a implementação usa os.stat em uma única syscall para size+mtime).
+        original_stat = os.stat
+
+        def patched_stat(path, *args, **kwargs):
+            if "blocked" in str(path):
+                raise PermissionError("Bloqueado pelo AV")
+            return original_stat(path, *args, **kwargs)
+
+        with patch("os.stat", side_effect=patched_stat):
             files = scanner.top_largest_files(tmp_path, n=50)
 
         # Não deve crashar; deve retornar pelo menos o arquivo ok.txt
         names = [Path(f.path).name for f in files]
         assert "ok.txt" in names
         assert "blocked.dat" not in names
+
+    def test_file_entry_has_modified_time(self, tmp_files_dir: Path):
+        """Regressão: FileEntry deve trazer modified_time preenchido (epoch)."""
+        scanner = StorageScanner()
+        files = scanner.top_largest_files(tmp_files_dir, n=50)
+
+        assert len(files) > 0
+        for f in files:
+            # Atributo deve existir e ser float positivo (timestamp Unix)
+            assert hasattr(f, "modified_time"), (
+                "FileEntry deve expor modified_time para persistência no DB"
+            )
+            assert isinstance(f.modified_time, float)
+            assert f.modified_time > 0, (
+                f"modified_time inválido: {f.modified_time} para {f.path}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -285,3 +302,303 @@ class TestFileEntryProperties:
     def test_size_mb_small(self):
         f = FileEntry(path="C:\\small.txt", size_bytes=1024)
         assert f.size_mb == pytest.approx(0.001, abs=0.01)
+
+    def test_modified_time_default_is_zero(self):
+        """Se não informado, modified_time = 0.0 (desconhecido)."""
+        f = FileEntry(path="C:\\file.txt", size_bytes=100)
+        assert f.modified_time == 0.0
+
+    def test_modified_time_explicit(self):
+        """Aceita timestamp epoch como float."""
+        ts = 1_700_000_000.5
+        f = FileEntry(path="C:\\file.txt", size_bytes=100, modified_time=ts)
+        assert f.modified_time == ts
+
+    def test_db_persistence_signature_compat(self):
+        """
+        Regressão para o bug 'AttributeError: FileEntry has no attribute
+        modified_time' que crashava workers.py após Etapa 3 da varredura.
+        Garante que os 3 atributos lidos por workers.py existem.
+        """
+        f = FileEntry(
+            path="C:\\file.txt",
+            size_bytes=100,
+            category="Outros",
+            modified_time=123.0,
+        )
+        # Campos efetivamente lidos em workers.py linha ~265
+        assert f.path == "C:\\file.txt"
+        assert f.size_bytes == 100
+        assert f.modified_time == 123.0
+        assert f.category == "Outros"
+
+
+# ---------------------------------------------------------------------------
+# DirEntry properties
+# ---------------------------------------------------------------------------
+
+class TestDirEntryProperties:
+    """Testa propriedades calculadas de DirEntry."""
+
+    def test_size_gb(self):
+        d = DirEntry(
+            path="D:\\Filmes",
+            total_size_bytes=2 * 1024 ** 3,
+            file_count=5,
+        )
+        assert d.size_gb == 2.0
+
+    def test_size_mb(self):
+        d = DirEntry(
+            path="D:\\Downloads",
+            total_size_bytes=512 * 1024 ** 2,
+            file_count=10,
+        )
+        assert d.size_mb == 512.0
+
+    def test_repr_contains_path(self):
+        d = DirEntry(path="E:\\Backup", total_size_bytes=1024, file_count=2)
+        r = repr(d)
+        assert "E:\\Backup" in r
+        assert "arquivos" in r
+
+
+# ---------------------------------------------------------------------------
+# top_dirs()
+# ---------------------------------------------------------------------------
+
+class TestTopDirs:
+    """Testa varredura e ranking dos maiores diretórios."""
+
+    def test_returns_empty_for_nonexistent_dir(self):
+        scanner = StorageScanner()
+        result = scanner.top_largest_dirs("Z:\\diretorio_que_nao_existe_mesmo", n=10)
+        assert result == []
+
+    def test_returns_dirs_sorted_by_size(self, tmp_path: Path):
+        scanner = StorageScanner()
+        big = tmp_path / "big_dir"
+        big.mkdir()
+        (big / "file.bin").write_bytes(b"\x00" * 10_000)
+
+        small = tmp_path / "small_dir"
+        small.mkdir()
+        (small / "file.bin").write_bytes(b"\x00" * 100)
+
+        results = scanner.top_largest_dirs(str(tmp_path), n=10)
+        assert len(results) >= 2
+        sizes = [d.total_size_bytes for d in results]
+        assert sizes == sorted(sizes, reverse=True), "Deve estar em ordem decrescente"
+
+    def test_respects_n_limit(self, tmp_path: Path):
+        scanner = StorageScanner()
+        for i in range(5):
+            d = tmp_path / f"dir_{i}"
+            d.mkdir()
+            (d / "f.bin").write_bytes(b"\x00" * (1_000 * (i + 1)))
+
+        results = scanner.top_largest_dirs(str(tmp_path), n=3)
+        assert len(results) <= 3
+
+    def test_skips_system_excluded_dirs(self, tmp_path: Path):
+        scanner = StorageScanner()
+        sys_dir = tmp_path / "Windows"
+        sys_dir.mkdir()
+        (sys_dir / "file.sys").write_bytes(b"\x00" * 5_000)
+
+        normal = tmp_path / "meus_arquivos"
+        normal.mkdir()
+        (normal / "file.bin").write_bytes(b"\x00" * 3_000)
+
+        results = scanner.top_largest_dirs(str(tmp_path), n=10)
+        paths = [d.path for d in results]
+        assert not any("Windows" in p for p in paths), "Dir do sistema deve ser ignorado"
+        assert any("meus_arquivos" in p for p in paths)
+
+    def test_skips_dollar_sign_dirs(self, tmp_path: Path):
+        scanner = StorageScanner()
+        dollar_dir = tmp_path / "$RECYCLE.BIN"
+        dollar_dir.mkdir()
+        (dollar_dir / "trash.bin").write_bytes(b"\x00" * 5_000)
+
+        normal = tmp_path / "normal"
+        normal.mkdir()
+        (normal / "file.txt").write_bytes(b"\x00" * 1_000)
+
+        results = scanner.top_largest_dirs(str(tmp_path), n=10)
+        paths = [d.path for d in results]
+        assert not any("$RECYCLE" in p for p in paths), "Diretório $ deve ser ignorado"
+
+    def test_excludes_empty_dirs(self, tmp_path: Path):
+        scanner = StorageScanner()
+        empty = tmp_path / "vazio"
+        empty.mkdir()
+        # Nenhum arquivo criado dentro
+
+        results = scanner.top_largest_dirs(str(tmp_path), n=10)
+        paths = [d.path for d in results]
+        assert not any("vazio" in p for p in paths), "Diretório vazio (0 bytes) deve ser excluído"
+
+    def test_dir_entry_has_correct_size_and_count(self, tmp_path: Path):
+        scanner = StorageScanner()
+        d = tmp_path / "my_dir"
+        d.mkdir()
+        (d / "a.txt").write_bytes(b"\x00" * 1_024)
+        (d / "b.txt").write_bytes(b"\x00" * 2_048)
+
+        results = scanner.top_largest_dirs(str(tmp_path), n=10)
+        assert len(results) == 1
+        entry = results[0]
+        assert entry.total_size_bytes == 3_072
+        assert entry.file_count == 2
+        assert "my_dir" in entry.path
+
+    def test_returns_dir_entry_instances(self, tmp_path: Path):
+        scanner = StorageScanner()
+        d = tmp_path / "dir_teste"
+        d.mkdir()
+        (d / "file.bin").write_bytes(b"\x00" * 512)
+
+        results = scanner.top_largest_dirs(str(tmp_path), n=10)
+        assert len(results) == 1
+        assert isinstance(results[0], DirEntry)
+
+
+# ---------------------------------------------------------------------------
+# _dir_size_recursive()
+# ---------------------------------------------------------------------------
+
+class TestDirSizeRecursive:
+    """Testa o cálculo recursivo de tamanho de diretórios."""
+
+    def test_sums_files_in_flat_dir(self, tmp_path: Path):
+        (tmp_path / "a.txt").write_bytes(b"\x00" * 1_000)
+        (tmp_path / "b.txt").write_bytes(b"\x00" * 2_000)
+
+        size, count = StorageScanner._dir_size_recursive(str(tmp_path))
+        assert size == 3_000
+        assert count == 2
+
+    def test_empty_dir_returns_zeros(self, tmp_path: Path):
+        size, count = StorageScanner._dir_size_recursive(str(tmp_path))
+        assert size == 0
+        assert count == 0
+
+    def test_recurses_into_subdirs(self, tmp_path: Path):
+        (tmp_path / "root.txt").write_bytes(b"\x00" * 500)
+        sub = tmp_path / "subdir"
+        sub.mkdir()
+        (sub / "nested.txt").write_bytes(b"\x00" * 300)
+
+        size, count = StorageScanner._dir_size_recursive(str(tmp_path), max_depth=2)
+        assert size == 800
+        assert count == 2
+
+    def test_respects_max_depth(self, tmp_path: Path):
+        # depth 0: root file
+        (tmp_path / "root.txt").write_bytes(b"\x00" * 1_000)
+        # depth 1: sub
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "sub.txt").write_bytes(b"\x00" * 500)
+        # depth 2: deep — deve ser excluído com max_depth=1
+        deep = sub / "deep"
+        deep.mkdir()
+        (deep / "deep.txt").write_bytes(b"\x00" * 200)
+
+        # current_depth=0, max_depth=1 → sub é visitado (0 < 1),
+        # mas deep não (1 < 1 é False)
+        size, count = StorageScanner._dir_size_recursive(
+            str(tmp_path), max_depth=1, current_depth=0
+        )
+        assert size == 1_500   # root.txt + sub.txt (deep.txt excluído)
+        assert count == 2
+
+    def test_handles_permission_error_on_subdir(self, tmp_path: Path):
+        (tmp_path / "ok.txt").write_bytes(b"\x00" * 100)
+        blocked = tmp_path / "blocked_sub"
+        blocked.mkdir()
+        (blocked / "secret.txt").write_bytes(b"\x00" * 1_000)
+
+        original_scandir = os.scandir
+
+        def patched_scandir(path):
+            if "blocked_sub" in str(path):
+                raise PermissionError("Acesso negado")
+            return original_scandir(path)
+
+        with patch("os.scandir", side_effect=patched_scandir):
+            size, count = StorageScanner._dir_size_recursive(
+                str(tmp_path), max_depth=2
+            )
+
+        # Apenas ok.txt deve ser contado
+        assert size == 100
+        assert count == 1
+
+    def test_skips_system_excluded_subdirs_during_recursion(self, tmp_path: Path):
+        (tmp_path / "normal.txt").write_bytes(b"\x00" * 500)
+        windows_dir = tmp_path / "Windows"
+        windows_dir.mkdir()
+        (windows_dir / "system.dll").write_bytes(b"\x00" * 5_000)
+
+        # "Windows" está em SYSTEM_EXCLUDED_DIRS → deve ser ignorado na recursão
+        size, count = StorageScanner._dir_size_recursive(str(tmp_path), max_depth=2)
+        assert size == 500
+        assert count == 1
+
+    def test_skips_entry_when_stat_raises_permission_error(self, tmp_path: Path):
+        """Erro de stat() em um entry específico não deve crashar; entry é silenciosamente ignorado."""
+        from unittest.mock import MagicMock
+
+        # Criar entradas falsas para simular um arquivo cujo stat() falha
+        good_entry = MagicMock()
+        good_entry.name = "ok.txt"
+        good_entry.path = str(tmp_path / "ok.txt")
+        good_entry.is_file.return_value = True
+        good_entry.is_dir.return_value = False
+        stat_result = MagicMock()
+        stat_result.st_size = 300
+        good_entry.stat.return_value = stat_result
+
+        bad_entry = MagicMock()
+        bad_entry.name = "locked.txt"
+        bad_entry.path = str(tmp_path / "locked.txt")
+        bad_entry.is_file.return_value = True
+        bad_entry.is_dir.return_value = False
+        bad_entry.stat.side_effect = PermissionError("Acesso negado ao stat()")
+
+        with patch("os.scandir", return_value=iter([good_entry, bad_entry])):
+            size, count = StorageScanner._dir_size_recursive(str(tmp_path), max_depth=2)
+
+        # Apenas o entry válido deve ser contado
+        assert size == 300
+        assert count == 1
+
+
+class TestTopLargestDirsEdgeCases:
+    """Cobre branches de erro em top_largest_dirs não atingidos pelos testes principais."""
+
+    def test_handles_permission_error_on_scandir(self, tmp_path: Path):
+        """PermissionError no os.scandir() de top_largest_dirs deve retornar lista vazia."""
+        scanner = StorageScanner()
+
+        with patch("os.scandir", side_effect=PermissionError("Acesso negado")):
+            results = scanner.top_largest_dirs(str(tmp_path), n=10)
+
+        assert results == []
+
+    def test_ignores_files_at_root_level(self, tmp_path: Path):
+        """Entradas não-diretório na raiz devem ser ignoradas (branch L308: continue)."""
+        scanner = StorageScanner()
+        # Arquivo diretamente na raiz — não é diretório, deve ser ignorado
+        (tmp_path / "root_file.txt").write_bytes(b"\x00" * 100)
+        # Diretório com conteúdo — deve aparecer nos resultados
+        d = tmp_path / "valid_dir"
+        d.mkdir()
+        (d / "file.bin").write_bytes(b"\x00" * 200)
+
+        results = scanner.top_largest_dirs(str(tmp_path), n=10)
+
+        assert len(results) == 1
+        assert "valid_dir" in results[0].path

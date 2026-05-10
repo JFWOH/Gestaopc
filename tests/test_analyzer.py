@@ -18,6 +18,7 @@ from unittest.mock import patch
 import pytest
 
 from src.core.scanner import FileEntry, PartitionInfo
+import src.core.analyzer as _analyzer_module
 from src.core.analyzer import (
     DuplicateDetector,
     DuplicateGroup,
@@ -393,3 +394,283 @@ class TestReallocationSuggestion:
         r = repr(s)
         assert "R1" in r
         assert "MOVER" in r
+
+
+# ---------------------------------------------------------------------------
+# DuplicateDetector — branches não cobertos
+# ---------------------------------------------------------------------------
+
+class TestDuplicateDetectorBranches:
+    """Cobre branches específicos do algoritmo de 3 etapas."""
+
+    def test_early_return_when_all_samples_unique(self, tmp_path: Path):
+        """
+        Etapa 2: arquivos com mesmo tamanho mas hashes de amostra distintos
+        resultam em sample_candidates vazio → retorno antecipado de [].
+
+        Garante cobertura da linha: `if not sample_candidates: return []`
+        """
+        size = 1_000
+        (tmp_path / "file_a.bin").write_bytes(b"A" * size)
+        (tmp_path / "file_b.bin").write_bytes(b"B" * size)
+
+        entries = [
+            FileEntry(path=str(tmp_path / "file_a.bin"), size_bytes=size),
+            FileEntry(path=str(tmp_path / "file_b.bin"), size_bytes=size),
+        ]
+
+        detector = DuplicateDetector()
+        groups = detector.find_duplicates(entries)
+        assert groups == []
+
+    def test_oserror_in_final_getsize_yields_size_zero(self, tmp_path: Path):
+        """
+        Etapa 3 — construção do resultado: se os.path.getsize(paths[0]) lançar
+        OSError, size_bytes deve ser 0 (branch de fallback na linha ~192).
+        """
+        content = b"identical content " * 50
+        f1 = tmp_path / "dup_a.bin"
+        f2 = tmp_path / "dup_b.bin"
+        f1.write_bytes(content)
+        f2.write_bytes(content)
+
+        entries = [
+            FileEntry(path=str(f1), size_bytes=len(content)),
+            FileEntry(path=str(f2), size_bytes=len(content)),
+        ]
+
+        real_getsize = os.path.getsize
+        call_counts: dict[str, int] = {}
+
+        def counting_getsize(path: str) -> int:
+            key = str(path)
+            call_counts[key] = call_counts.get(key, 0) + 1
+            # As primeiras chamadas vêm do _hash_sample (uma por arquivo).
+            # A 2ª chamada ao mesmo caminho vem da fase de resultado.
+            if call_counts[key] >= 2:
+                raise OSError("Arquivo sumiu")
+            return real_getsize(path)
+
+        detector = DuplicateDetector()
+        with patch("os.path.getsize", side_effect=counting_getsize):
+            groups = detector.find_duplicates(entries)
+
+        assert len(groups) == 1
+        assert groups[0].size_bytes == 0, "OSError em getsize deve resultar em size_bytes=0"
+
+    def test_hash_sample_reads_tail_for_large_file(self, tmp_path: Path):
+        """
+        _hash_sample lê os últimos _SAMPLE_SIZE bytes quando o arquivo
+        é maior que 2 × _SAMPLE_SIZE (branch L234-237).
+
+        Estratégia: patch _SAMPLE_SIZE=5 so qualquer arquivo >10 bytes
+        aciona a leitura do tail.
+        """
+        small_sample = 5
+        # 30 bytes > 2*5=10 → branch de tail será ativado
+        head = b"HEADX"         # 5 bytes — head lido
+        middle = b"\x00" * 20  # 20 bytes de padding
+        tail_a = b"TAILA"      # 5 bytes — tail do arquivo A
+        tail_b = b"TAILB"      # 5 bytes — tail diferente
+
+        fa = tmp_path / "file_a.bin"
+        fb = tmp_path / "file_b.bin"
+        fa.write_bytes(head + middle + tail_a)
+        fb.write_bytes(head + middle + tail_b)
+
+        with patch.object(_analyzer_module, "_SAMPLE_SIZE", small_sample):
+            ha = DuplicateDetector._hash_sample(str(fa))
+            hb = DuplicateDetector._hash_sample(str(fb))
+
+        assert ha is not None
+        assert hb is not None
+        assert ha != hb, "Tails diferentes devem gerar hashes diferentes"
+
+        # Verificar também que dois arquivos idênticos (inclusive o tail) geram hashes iguais
+        fc = tmp_path / "file_c.bin"
+        fc.write_bytes(head + middle + tail_a)  # cópia de fa
+
+        with patch.object(_analyzer_module, "_SAMPLE_SIZE", small_sample):
+            hc = DuplicateDetector._hash_sample(str(fc))
+
+        assert hc == ha, "Conteúdo idêntico deve gerar hash idêntico"
+
+    def test_hash_full_returns_none_on_permission_error(self, tmp_path: Path):
+        """
+        _hash_full deve retornar None quando open() lançar PermissionError
+        (branch L266-272).
+        """
+        f = tmp_path / "locked.bin"
+        f.write_bytes(b"algum conteudo")
+
+        with patch("builtins.open", side_effect=PermissionError("Acesso negado")):
+            result = DuplicateDetector._hash_full(str(f))
+
+        assert result is None
+
+    def test_hash_full_returns_none_on_oserror(self, tmp_path: Path):
+        """
+        _hash_full deve retornar None quando open() lançar OSError genérico.
+        """
+        f = tmp_path / "broken.bin"
+        f.write_bytes(b"conteudo")
+
+        with patch("builtins.open", side_effect=OSError("Disco com falha")):
+            result = DuplicateDetector._hash_full(str(f))
+
+        assert result is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sprint 7.4 — DuplicateDetector + HashCache
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDuplicateDetectorWithCache:
+    """
+    Garante que find_duplicates respeita um HashCache fornecido:
+      - Lê hashes do cache antes de recomputar
+      - Escreve hashes recém-computados de volta ao cache
+      - Mantém comportamento idêntico ao default (NullHashCache)
+    """
+
+    def _two_duplicates(self, tmp_path: Path) -> list[FileEntry]:
+        """Cria 2 arquivos idênticos e retorna FileEntry list."""
+        content = b"identical content for cache tests " * 10
+        f1 = tmp_path / "dup_a.bin"
+        f2 = tmp_path / "dup_b.bin"
+        f1.write_bytes(content)
+        f2.write_bytes(content)
+        return [
+            FileEntry(path=str(f1), size_bytes=len(content)),
+            FileEntry(path=str(f2), size_bytes=len(content)),
+        ]
+
+    def test_no_cache_arg_keeps_original_behavior(self, tmp_path: Path):
+        """find_duplicates sem cache funciona como antes do Sprint 7.4."""
+        entries = self._two_duplicates(tmp_path)
+        detector = DuplicateDetector()
+        groups = detector.find_duplicates(entries)
+        assert len(groups) == 1
+        assert groups[0].count == 2
+
+    def test_writes_computed_hashes_to_cache(self, tmp_path: Path):
+        """Após detecção, partial_writes e full_writes devem estar populados."""
+        from src.core.hash_cache import InMemoryHashCache
+
+        entries = self._two_duplicates(tmp_path)
+        cache = InMemoryHashCache()
+
+        detector = DuplicateDetector()
+        groups = detector.find_duplicates(entries, cache=cache)
+
+        assert len(groups) == 1
+        # Ambos os arquivos devem ter hash parcial e completo no cache
+        assert len(cache.partial_writes) == 2
+        assert len(cache.full_writes) == 2
+        for f in entries:
+            assert cache.get_partial(f.path) is not None
+            assert cache.get_full(f.path) is not None
+
+    def test_seeded_cache_skips_recomputation(self, tmp_path: Path):
+        """
+        Cache pré-populado com hashes válidos deve impedir _hash_sample/full
+        de ser chamado. Verificamos via patch.
+        """
+        from src.core.hash_cache import InMemoryHashCache
+
+        entries = self._two_duplicates(tmp_path)
+        cache = InMemoryHashCache()
+
+        # Calcular hashes "verdadeiros" primeiro
+        true_partial = DuplicateDetector._hash_sample(entries[0].path)
+        true_full = DuplicateDetector._hash_full(entries[0].path)
+
+        # Seedar cache para AMBOS os arquivos com os mesmos hashes
+        # (eles são duplicatas, então hash deve ser igual)
+        for f in entries:
+            cache.seed_partial(f.path, true_partial)
+            cache.seed_full(f.path, true_full)
+
+        # Patch para detectar se _hash_* são chamados
+        with patch.object(
+            DuplicateDetector, "_hash_sample", wraps=DuplicateDetector._hash_sample
+        ) as mock_sample, patch.object(
+            DuplicateDetector, "_hash_full", wraps=DuplicateDetector._hash_full
+        ) as mock_full:
+            detector = DuplicateDetector()
+            groups = detector.find_duplicates(entries, cache=cache)
+
+        assert len(groups) == 1
+        # Cache hit em ambas as etapas → sem chamadas a _hash_*
+        assert mock_sample.call_count == 0, (
+            f"_hash_sample não deveria ser chamado (chamadas: {mock_sample.call_count})"
+        )
+        assert mock_full.call_count == 0, (
+            f"_hash_full não deveria ser chamado (chamadas: {mock_full.call_count})"
+        )
+        # Cache hits foram contabilizados, sem novos writes
+        assert cache.partial_hits == 2
+        assert cache.full_hits == 2
+        assert len(cache.partial_writes) == 0
+        assert len(cache.full_writes) == 0
+
+    def test_partial_seed_only_skips_partial_recomputes_full(
+        self, tmp_path: Path
+    ):
+        """Seed só de partial → partial reusado, full ainda computado."""
+        from src.core.hash_cache import InMemoryHashCache
+
+        entries = self._two_duplicates(tmp_path)
+        cache = InMemoryHashCache()
+
+        true_partial = DuplicateDetector._hash_sample(entries[0].path)
+        for f in entries:
+            cache.seed_partial(f.path, true_partial)
+        # Note: NÃO seedamos full
+
+        detector = DuplicateDetector()
+        groups = detector.find_duplicates(entries, cache=cache)
+
+        assert len(groups) == 1
+        assert cache.partial_hits == 2
+        assert len(cache.partial_writes) == 0
+        # Full hash foi computado e cacheado
+        assert len(cache.full_writes) == 2
+
+    def test_null_cache_behaves_like_no_cache(self, tmp_path: Path):
+        """NullHashCache é o default e não persiste nada."""
+        from src.core.hash_cache import NullHashCache
+
+        entries = self._two_duplicates(tmp_path)
+        cache = NullHashCache()
+
+        detector = DuplicateDetector()
+        groups_no_arg = detector.find_duplicates(entries)
+        groups_null = detector.find_duplicates(entries, cache=cache)
+
+        # Mesmo resultado com e sem cache
+        assert len(groups_no_arg) == len(groups_null) == 1
+
+    def test_stale_cache_entry_recomputes(self, tmp_path: Path):
+        """
+        Se o cache tem hash 'errado' (ex: arquivo modificado mas seed não
+        atualizado), o detector vai produzir resultado incorreto. Esta
+        situação É responsabilidade do chamador (workers.py) — o detector
+        confia no cache. Este teste documenta o contrato.
+        """
+        from src.core.hash_cache import InMemoryHashCache
+
+        entries = self._two_duplicates(tmp_path)
+        cache = InMemoryHashCache()
+
+        # Seedar com hashes deliberadamente DIFERENTES entre os dois arquivos
+        cache.seed_partial(entries[0].path, "hash_A_fake")
+        cache.seed_partial(entries[1].path, "hash_B_fake")
+        # Sem seed do full
+
+        detector = DuplicateDetector()
+        groups = detector.find_duplicates(entries, cache=cache)
+
+        # Como os partial hashes diferem (no cache), Etapa 2 separa em grupos
+        # de 1 arquivo cada → sample_candidates vazio → return [] cedo
+        assert groups == []

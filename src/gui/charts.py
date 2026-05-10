@@ -11,8 +11,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from PyQt6.QtCore import Qt, QRectF, QPointF
-from PyQt6.QtGui import (
+from PySide6.QtCore import Qt, QRectF, QPointF
+from PySide6.QtGui import (
     QColor,
     QConicalGradient,
     QFont,
@@ -22,7 +22,7 @@ from PyQt6.QtGui import (
     QPen,
     QLinearGradient,
 )
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSizePolicy
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSizePolicy
 
 from src.gui.styles import Colors, Fonts
 

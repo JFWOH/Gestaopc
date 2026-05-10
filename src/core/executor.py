@@ -21,11 +21,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from PyQt6.QtCore import QThread, pyqtSignal
+from PySide6.QtCore import QThread, Signal
 
 from src.core.storage_db import StorageManagerDB
+from src.core.path_guard import validate_path
 
 logger = logging.getLogger(__name__)
+
+# Limite máximo de arquivos em uma única operação em batch.
+# Protege contra loops infinitos ou ações acidentais em grande escala.
+# Sprint 7.6: valor canônico em src/core/config.py; alias mantido para
+# compatibilidade com tests que checam `from src.core.executor import MAX_BATCH_SIZE`.
+from src.core.config import EXECUTOR_MAX_BATCH_SIZE
+
+MAX_BATCH_SIZE: int = EXECUTOR_MAX_BATCH_SIZE
 
 # Tentar importar send2trash para deleção segura (Lixeira).
 try:
@@ -126,6 +135,15 @@ class SafeFileExecutor:
             target_path=target,
         )
 
+        # Validar caminhos antes de qualquer operação de I/O
+        for label, path_str in (("origem", source), ("destino", target)):
+            ok, err = validate_path(path_str)
+            if not ok:
+                record.error = f"Caminho de {label} inválido: {err}"
+                logger.warning("Move bloqueado — %s", record.error)
+                self.history.append(record)
+                return record
+
         try:
             src = Path(source)
             if not src.exists():
@@ -181,6 +199,14 @@ class SafeFileExecutor:
             action="DELETAR",
             source_path=filepath,
         )
+
+        # Validar caminho antes de qualquer operação de I/O
+        ok, err = validate_path(filepath)
+        if not ok:
+            record.error = f"Caminho inválido: {err}"
+            logger.warning("Delete bloqueado — %s", record.error)
+            self.history.append(record)
+            return record
 
         try:
             p = Path(filepath)
@@ -277,10 +303,10 @@ class FileActionWorker(QThread):
         Emitido quando todas as ações terminam.
     """
 
-    progress = pyqtSignal(str)
-    progress_percent = pyqtSignal(int)
-    action_completed = pyqtSignal(object)     # OperationRecord
-    finished_all = pyqtSignal(object)         # list[OperationRecord]
+    progress = Signal(str)
+    progress_percent = Signal(int)
+    action_completed = Signal(object)     # OperationRecord
+    finished_all = Signal(object)         # list[OperationRecord]
 
     def __init__(self, actions: list[FileAction], db: StorageManagerDB | None = None, parent=None):
         super().__init__(parent)
@@ -296,6 +322,28 @@ class FileActionWorker(QThread):
         """Executa todas as ações em sequência."""
         results: list[OperationRecord] = []
         total = len(self._actions)
+
+        # Proteção contra batches excessivamente grandes
+        if total > MAX_BATCH_SIZE:
+            err_msg = (
+                f"Batch de {total} ações excede o limite de {MAX_BATCH_SIZE}. "
+                "Divida em operações menores."
+            )
+            logger.warning(err_msg)
+            for action in self._actions:
+                results.append(
+                    OperationRecord(
+                        timestamp=time.time(),
+                        action=action.action,
+                        source_path=action.source_path,
+                        target_path=action.target_path,
+                        success=False,
+                        error=err_msg,
+                    )
+                )
+            self.progress.emit(err_msg)
+            self.finished_all.emit(results)
+            return
 
         for idx, action in enumerate(self._actions):
             if self._abort:

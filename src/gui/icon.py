@@ -7,8 +7,8 @@ com menu de contexto para acesso rápido.
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import (
+from PySide6.QtCore import Qt, QSize
+from PySide6.QtGui import (
     QColor,
     QFont,
     QIcon,
@@ -17,7 +17,7 @@ from PyQt6.QtGui import (
     QPen,
     QPixmap,
 )
-from PyQt6.QtWidgets import QMenu, QSystemTrayIcon, QWidget
+from PySide6.QtWidgets import QMenu, QSystemTrayIcon, QWidget
 
 from src.gui.styles import Colors
 
@@ -62,7 +62,7 @@ def create_app_icon(size: int = 128) -> QIcon:
     painter.setPen(arc_pen)
     arc_margin = size * 0.18
     arc_size = size - arc_margin * 2
-    from PyQt6.QtCore import QRectF
+    from PySide6.QtCore import QRectF
     arc_rect = QRectF(arc_margin, arc_margin, arc_size, arc_size)
     painter.drawArc(arc_rect, 45 * 16, 90 * 16)  # Arco de 90° no topo-direita
 

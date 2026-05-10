@@ -530,6 +530,73 @@ class StorageManagerDB:
             "SELECT * FROM file_index WHERE path = ?", (path,)
         ).fetchone()
 
+    def get_file_index_batch(
+        self, paths: list[str]
+    ) -> dict[str, sqlite3.Row]:
+        """
+        Sprint 7.4: lookup em lote para o cache de hash.
+
+        Faz UMA query SELECT ... WHERE path IN (?, ?, ...) e retorna um dict
+        path → row. Evita N round-trips ao SQLite quando o detector precisa
+        consultar centenas de candidatos.
+
+        SQLite limita 999 placeholders por query (compile-time
+        SQLITE_MAX_VARIABLE_NUMBER); fazemos chunking em batches de 500.
+        """
+        if not paths:
+            return {}
+
+        result: dict[str, sqlite3.Row] = {}
+        BATCH = 500
+        for i in range(0, len(paths), BATCH):
+            chunk = paths[i:i + BATCH]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self._db.execute(
+                f"SELECT * FROM file_index WHERE path IN ({placeholders})",  # noqa: S608
+                chunk,
+            ).fetchall()
+            for row in rows:
+                result[row["path"]] = row
+        return result
+
+    def update_file_hashes_batch(
+        self, updates: list[tuple[str, str | None, str | None]]
+    ) -> int:
+        """
+        Sprint 7.4: persistência em lote dos hashes recém-computados.
+
+        Recebe uma lista de tuplas (path, partial_hash, full_hash) onde os
+        hashes podem ser None (significa "não atualizar este campo"). Faz
+        UPDATE atômico em uma transação. Retorna a quantidade de linhas
+        afetadas.
+
+        Ignora silenciosamente paths que não existem na tabela — o caller
+        deve garantir que chamou upsert_file_index antes para criar a row.
+        """
+        if not updates:
+            return 0
+        affected = 0
+        with self._db:
+            for path, partial, full in updates:
+                # Construir UPDATE dinâmico para evitar sobrescrever com None
+                fields: list[str] = []
+                values: list = []
+                if partial is not None:
+                    fields.append("partial_hash = ?")
+                    values.append(partial)
+                if full is not None:
+                    fields.append("full_hash = ?")
+                    values.append(full)
+                if not fields:
+                    continue
+                values.append(path)
+                cur = self._db.execute(
+                    f"UPDATE file_index SET {', '.join(fields)} WHERE path = ?",  # noqa: S608
+                    values,
+                )
+                affected += cur.rowcount
+        return affected
+
     def remove_file_index(self, path: str) -> None:
         """Remove uma entrada do índice pelo caminho."""
         with self._db:

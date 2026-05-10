@@ -16,13 +16,15 @@ import urllib.request
 import urllib.error
 from typing import Any, Callable, Iterator
 
+from src.core.config import OLLAMA_DEFAULT_HOST
+
 logger = logging.getLogger(__name__)
 
 
 class OllamaClient:
     """Cliente HTTP para o servidor Ollama local (padrão: localhost:11434)."""
 
-    def __init__(self, host: str = "http://localhost:11434"):
+    def __init__(self, host: str = OLLAMA_DEFAULT_HOST):
         self.host = host
 
     # ─────────────────────────────────────────────────────────────────────────
