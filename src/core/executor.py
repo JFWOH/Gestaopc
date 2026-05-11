@@ -21,7 +21,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from PySide6.QtCore import QThread, Signal
+# PySide6 é necessário apenas para FileActionWorker (QThread de GUI).
+# O import é defensivo para que executor.py seja importável em contextos
+# headless (MCP server, scripts CLI, .venv sem Qt) onde PySide6 não está
+# instalado. SafeFileExecutor e todos os helpers puros não dependem de Qt.
+try:
+    from PySide6.QtCore import QThread, Signal
+    _HAS_PYSIDE6 = True
+except ImportError:  # ambiente headless (MCP server, CLI, etc.)
+    _HAS_PYSIDE6 = False
 
 from src.core.storage_db import StorageManagerDB
 from src.core.path_guard import validate_path
@@ -287,84 +295,88 @@ class FileAction:
     target_path: str = ""
 
 
-class FileActionWorker(QThread):
-    """
-    Thread para executar uma lista de ações de arquivo em background.
+if _HAS_PYSIDE6:
+    class FileActionWorker(QThread):  # type: ignore[misc]
+        """
+        Thread para executar uma lista de ações de arquivo em background.
 
-    Signals
-    -------
-    progress(str)
-        Mensagem de status intermediário.
-    progress_percent(int)
-        Porcentagem de progresso (0–100).
-    action_completed(OperationRecord)
-        Emitido após cada ação individual.
-    finished_all(list[OperationRecord])
-        Emitido quando todas as ações terminam.
-    """
+        Disponível apenas quando PySide6 está instalado (ambiente GUI).
+        Em contextos headless (MCP server, CLI) este bloco é ignorado.
 
-    progress = Signal(str)
-    progress_percent = Signal(int)
-    action_completed = Signal(object)     # OperationRecord
-    finished_all = Signal(object)         # list[OperationRecord]
+        Signals
+        -------
+        progress(str)
+            Mensagem de status intermediário.
+        progress_percent(int)
+            Porcentagem de progresso (0–100).
+        action_completed(OperationRecord)
+            Emitido após cada ação individual.
+        finished_all(list[OperationRecord])
+            Emitido quando todas as ações terminam.
+        """
 
-    def __init__(self, actions: list[FileAction], db: StorageManagerDB | None = None, parent=None):
-        super().__init__(parent)
-        self._actions = actions
-        self._abort = False
-        self._executor = SafeFileExecutor(db=db)
+        progress = Signal(str)
+        progress_percent = Signal(int)
+        action_completed = Signal(object)     # OperationRecord
+        finished_all = Signal(object)         # list[OperationRecord]
 
-    def abort(self):
-        """Sinaliza para a thread parar na próxima oportunidade."""
-        self._abort = True
+        def __init__(self, actions: list[FileAction], db: StorageManagerDB | None = None, parent=None):
+            super().__init__(parent)
+            self._actions = actions
+            self._abort = False
+            self._executor = SafeFileExecutor(db=db)
 
-    def run(self):
-        """Executa todas as ações em sequência."""
-        results: list[OperationRecord] = []
-        total = len(self._actions)
+        def abort(self):
+            """Sinaliza para a thread parar na próxima oportunidade."""
+            self._abort = True
 
-        # Proteção contra batches excessivamente grandes
-        if total > MAX_BATCH_SIZE:
-            err_msg = (
-                f"Batch de {total} ações excede o limite de {MAX_BATCH_SIZE}. "
-                "Divida em operações menores."
-            )
-            logger.warning(err_msg)
-            for action in self._actions:
-                results.append(
-                    OperationRecord(
-                        timestamp=time.time(),
-                        action=action.action,
-                        source_path=action.source_path,
-                        target_path=action.target_path,
-                        success=False,
-                        error=err_msg,
-                    )
+        def run(self):
+            """Executa todas as ações em sequência."""
+            results: list[OperationRecord] = []
+            total = len(self._actions)
+
+            # Proteção contra batches excessivamente grandes
+            if total > MAX_BATCH_SIZE:
+                err_msg = (
+                    f"Batch de {total} ações excede o limite de {MAX_BATCH_SIZE}. "
+                    "Divida em operações menores."
                 )
-            self.progress.emit(err_msg)
+                logger.warning(err_msg)
+                for action in self._actions:
+                    results.append(
+                        OperationRecord(
+                            timestamp=time.time(),
+                            action=action.action,
+                            source_path=action.source_path,
+                            target_path=action.target_path,
+                            success=False,
+                            error=err_msg,
+                        )
+                    )
+                self.progress.emit(err_msg)
+                self.finished_all.emit(results)
+                return
+
+            for idx, action in enumerate(self._actions):
+                if self._abort:
+                    break
+
+                pct = int(((idx + 1) / max(total, 1)) * 100)
+                name = Path(action.source_path).name
+                self.progress.emit(f"[{idx+1}/{total}] {action.action}: {name}")
+                self.progress_percent.emit(pct)
+
+                if action.action == "MOVER":
+                    record = self._executor.move_file(action.source_path, action.target_path)
+                else:
+                    record = self._executor.delete_file(action.source_path)
+
+                results.append(record)
+                self.action_completed.emit(record)
+
+            self.progress.emit("Operacoes concluidas.")
             self.finished_all.emit(results)
-            return
 
-        for idx, action in enumerate(self._actions):
-            if self._abort:
-                break
-
-            pct = int(((idx + 1) / max(total, 1)) * 100)
-            name = Path(action.source_path).name
-            self.progress.emit(f"[{idx+1}/{total}] {action.action}: {name}")
-            self.progress_percent.emit(pct)
-
-            if action.action == "MOVER":
-                record = self._executor.move_file(action.source_path, action.target_path)
-            else:
-                record = self._executor.delete_file(action.source_path)
-
-            results.append(record)
-            self.action_completed.emit(record)
-
-        self.progress.emit("Operacoes concluidas.")
-        self.finished_all.emit(results)
-
-    @property
-    def executor(self) -> SafeFileExecutor:
-        return self._executor
+        @property
+        def executor(self) -> SafeFileExecutor:
+            return self._executor

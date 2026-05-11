@@ -285,5 +285,6 @@ def set_disk_role(drive_letter: str, role: str, confirmation_token: str) -> dict
 
 
 if __name__ == "__main__":
-    # Inicia o servidor usando transporte stdin/stdout (padrão MCP)
-    mcp.run()
+    # Inicia o servidor usando transporte stdin/stdout (padrão MCP).
+    # `transport="stdio"` é explícito para compatibilidade com MCP SDK ≥ 1.9.
+    mcp.run(transport="stdio")
