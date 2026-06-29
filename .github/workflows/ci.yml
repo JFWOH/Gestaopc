@@ -1,0 +1,43 @@
+name: CI
+
+# RECON 5.4 / 8.3.5 — pipeline mínimo que tranca o estado verde:
+# ruff (lint) + mypy (type-check) em src/ e a suíte de testes completa.
+# Runner Windows: o app é Windows-específico (detecção de hardware via
+# PowerShell; os testes mockam isso). QT_QPA_PLATFORM=offscreen permite que
+# os testes de PySide6 rodem sem display.
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Instalar projeto (editable) + extras de dev
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint (ruff) — src/
+        run: python -m ruff check src/
+
+      - name: Type-check (mypy) — src/
+        run: python -m mypy src/
+
+      - name: Testes (pytest)
+        run: python -m pytest tests/ -q
