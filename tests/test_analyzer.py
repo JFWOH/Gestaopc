@@ -15,7 +15,6 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 
 from src.core.scanner import FileEntry, PartitionInfo
 import src.core.analyzer as _analyzer_module
@@ -24,9 +23,7 @@ from src.core.analyzer import (
     DuplicateGroup,
     SmartRulesEngine,
     ReallocationSuggestion,
-    _HEAVY_MEDIA_EXTENSIONS,
     _1GB,
-    _MEDIA_CATEGORIES,
 )
 
 

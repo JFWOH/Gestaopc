@@ -15,9 +15,9 @@ import pytest
 
 PySide6 = pytest.importorskip("PySide6")
 
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtCore import QCoreApplication  # noqa: E402  (após importorskip)
 
-from src.gui.workers import FullScanWorker
+from src.gui.workers import FullScanWorker  # noqa: E402  (após importorskip)
 
 
 # Sprint 7.3.1: usamos duck-typing em vez de isinstance(sig, pyqtBoundSignal)
@@ -88,7 +88,7 @@ class TestScanStatusSignals:
         worker = FullScanWorker()
         received: list[tuple[str, str, str]] = []
         worker.disk_state_changed.connect(
-            lambda l, s, t: received.append((l, s, t))
+            lambda letter, state, text: received.append((letter, state, text))
         )
         worker.disk_state_changed.emit("C:", "scanning", "Analisando…")
         worker.disk_state_changed.emit("D:", "done", "")

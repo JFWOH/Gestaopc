@@ -28,9 +28,9 @@ import pytest
 # Pular todos os testes deste arquivo se PyQt6 não estiver disponível
 PySide6 = pytest.importorskip("PySide6")
 
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtCore import QCoreApplication  # noqa: E402  (após importorskip)
 
-from src.gui.log_bridge import QtLogBridge, _SignalHandler
+from src.gui.log_bridge import QtLogBridge, _SignalHandler  # noqa: E402  (após importorskip)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -47,9 +47,9 @@ def tmp_db(tmp_path, monkeypatch):
         return db_path
 
     monkeypatch.setattr(tb, "get_default_db_path", _fake_db_path)
-    # Inicializar schema
-    with StorageManagerDB(db_path) as db:
-        pass  # __enter__ chama initialize()
+    # Inicializar schema (o context manager chama initialize() no __enter__)
+    with StorageManagerDB(db_path):
+        pass
     return db_path
 
 
@@ -447,7 +447,6 @@ class TestMoveToTrash:
             mock_trash.side_effect = fake_trash
 
             # Importar send2trash diretamente no escopo do módulo
-            import src.core.ai_toolbelt as mod
             with patch.dict("sys.modules", {"send2trash": MagicMock(send2trash=fake_trash)}):
                 result = tb.move_to_trash(str(victim), tok["token"])
 

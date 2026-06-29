@@ -20,7 +20,6 @@ import pytest
 from pathlib import Path
 
 from src.core.skills_loader import (
-    Skill,
     _name_from_filename,
     _parse_frontmatter,
     get_skill_by_name,

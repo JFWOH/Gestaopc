@@ -22,7 +22,6 @@ from src.core.scanner import (
     FileEntry,
     PartitionInfo,
     FILE_CATEGORIES,
-    SYSTEM_EXCLUDED_DIRS,
     _MEDIA_TYPE_PS_SCRIPT,
 )
 

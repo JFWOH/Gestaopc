@@ -91,7 +91,7 @@ def _insert_sug(database: StorageManagerDB, **overrides) -> int:
 
 def test_db_file_is_created(tmp_path):
     db_path = tmp_path / "sub" / "new.db"
-    with StorageManagerDB(db_path) as database:
+    with StorageManagerDB(db_path):
         pass
     assert db_path.exists(), "Arquivo .db deve ser criado"
 
@@ -298,6 +298,7 @@ def test_insert_operation_all_optional_fields(db):
         source_mtime=1234560000.0,
         content_hash="abc123",
     )
+    assert op_id > 0, "insert_operation deve retornar o id gerado pelo banco"
     row = db.list_operations()[0]
     assert row["error"] == "PermissionError"
     assert bool(row["used_trash"]) is True

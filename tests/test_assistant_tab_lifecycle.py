@@ -30,9 +30,9 @@ import pytest
 
 PySide6 = pytest.importorskip("PySide6")
 
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QCloseEvent  # noqa: E402  (após importorskip)
 
-from src.gui.assistant_tab import AssistantTab
+from src.gui.assistant_tab import AssistantTab  # noqa: E402  (após importorskip)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
