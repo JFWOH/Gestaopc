@@ -8,15 +8,13 @@ Implementa os gráficos solicitados na Seção 4 da spec:
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
-from PySide6.QtCore import Qt, QRectF, QPointF
+from PySide6.QtCore import Qt, QRectF
 from PySide6.QtGui import (
     QColor,
     QConicalGradient,
     QFont,
-    QFontMetrics,
     QPainter,
     QPainterPath,
     QPen,
@@ -193,8 +191,10 @@ class DonutChartWithLegend(QWidget):
         # Reconstruir legenda
         while self._legend_layout.count() > 1:
             item = self._legend_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            if item is not None:
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
 
         for seg in segments:
             row = QHBoxLayout()

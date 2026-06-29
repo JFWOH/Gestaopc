@@ -373,7 +373,10 @@ class MainWindow(QMainWindow):
         self.status_progress.setValue(0)
         self.status_bar.showMessage(status_msg)
 
-        self._action_worker = FileActionWorker(actions, self)
+        # `self` é o parent (QThread ownership), não o db. Passá-lo como db
+        # (2º posicional) era um bug: SafeFileExecutor._persist_record chamaria
+        # MainWindow.insert_operation(...) → AttributeError em runtime.
+        self._action_worker = FileActionWorker(actions, parent=self)
         self._action_worker.progress.connect(self.status_bar.showMessage)
         self._action_worker.progress_percent.connect(self.status_progress.setValue)
         self._action_worker.finished_all.connect(self._on_actions_finished)

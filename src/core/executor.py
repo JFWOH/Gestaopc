@@ -17,7 +17,7 @@ import logging
 import os
 import shutil
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -31,6 +31,7 @@ try:
 except ImportError:  # ambiente headless (MCP server, CLI, etc.)
     _HAS_PYSIDE6 = False
 
+from src.core.config import EXECUTOR_MAX_BATCH_SIZE
 from src.core.storage_db import StorageManagerDB
 from src.core.path_guard import validate_path
 
@@ -40,8 +41,6 @@ logger = logging.getLogger(__name__)
 # Protege contra loops infinitos ou ações acidentais em grande escala.
 # Sprint 7.6: valor canônico em src/core/config.py; alias mantido para
 # compatibilidade com tests que checam `from src.core.executor import MAX_BATCH_SIZE`.
-from src.core.config import EXECUTOR_MAX_BATCH_SIZE
-
 MAX_BATCH_SIZE: int = EXECUTOR_MAX_BATCH_SIZE
 
 # Tentar importar send2trash para deleção segura (Lixeira).

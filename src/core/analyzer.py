@@ -579,7 +579,9 @@ if __name__ == "__main__":
     import sys
 
     # Forcar UTF-8 no stdout do Windows para evitar UnicodeEncodeError.
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    # hasattr: reconfigure() existe em TextIOWrapper, não em stdout redirecionado.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     logging.basicConfig(
         level=logging.INFO,

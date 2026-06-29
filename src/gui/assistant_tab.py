@@ -188,7 +188,8 @@ class AssistantTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._client = OllamaClient()
-        self._db = StorageManagerDB(get_default_db_path())
+        # Optional: definido como None no closeEvent (cleanup do SQLite).
+        self._db: StorageManagerDB | None = StorageManagerDB(get_default_db_path())
         self._db.initialize()
 
         # Histórico de mensagens do chat (formato Ollama)

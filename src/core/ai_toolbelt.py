@@ -26,7 +26,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import secrets
 import shutil
 import time
@@ -34,6 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from src.core.config import AI_MAX_EXEC_PER_MINUTE, AI_TOKEN_TTL_SECONDS
 from src.core.scanner import StorageScanner
 from src.core.storage_db import StorageManagerDB, get_default_db_path
 from src.core.path_guard import (
@@ -66,8 +66,6 @@ EXECUTIVE_ACTIONS: set[str] = {
 }
 
 # Limites de execução — Sprint 7.6: valores canônicos em src/core/config.py.
-from src.core.config import AI_MAX_EXEC_PER_MINUTE, AI_TOKEN_TTL_SECONDS
-
 _MAX_EXEC_PER_MINUTE: int = AI_MAX_EXEC_PER_MINUTE
 _TOKEN_TTL_SECONDS: int = AI_TOKEN_TTL_SECONDS
 
