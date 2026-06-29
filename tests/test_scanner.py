@@ -267,6 +267,62 @@ class TestListPartitions:
 
         assert len(partitions) == 0
 
+    def test_warns_when_media_detection_fails(self, caplog):
+        """RECON 8.3.4 — mapa de mídia vazio com partições presentes deve avisar."""
+        scanner = StorageScanner()
+
+        mock_part = MagicMock()
+        mock_part.mountpoint = "C:\\"
+        mock_part.fstype = "NTFS"
+        mock_part.opts = ""
+
+        mock_usage = MagicMock()
+        mock_usage.total = 500_000_000_000
+        mock_usage.used = 100_000_000_000
+        mock_usage.free = 400_000_000_000
+        mock_usage.percent = 20.0
+
+        with patch("psutil.disk_partitions", return_value=[mock_part]), \
+             patch("psutil.disk_usage", return_value=mock_usage), \
+             patch.object(StorageScanner, "_detect_media_types", return_value={}), \
+             caplog.at_level("WARNING"):
+
+            partitions = scanner.list_partitions()
+
+        assert len(partitions) == 1
+        assert partitions[0].media_type == "Desconhecido"
+        assert any(
+            "Detecção de tipo de disco indisponível" in rec.message
+            for rec in caplog.records
+        )
+
+    def test_no_warning_when_media_detected(self, caplog):
+        """Mapa de mídia presente NÃO deve emitir o aviso de degradação."""
+        scanner = StorageScanner()
+
+        mock_part = MagicMock()
+        mock_part.mountpoint = "C:\\"
+        mock_part.fstype = "NTFS"
+        mock_part.opts = ""
+
+        mock_usage = MagicMock()
+        mock_usage.total = 500_000_000_000
+        mock_usage.used = 100_000_000_000
+        mock_usage.free = 400_000_000_000
+        mock_usage.percent = 20.0
+
+        with patch("psutil.disk_partitions", return_value=[mock_part]), \
+             patch("psutil.disk_usage", return_value=mock_usage), \
+             patch.object(StorageScanner, "_detect_media_types", return_value={"C:": "NVMe"}), \
+             caplog.at_level("WARNING"):
+
+            scanner.list_partitions()
+
+        assert not any(
+            "Detecção de tipo de disco indisponível" in rec.message
+            for rec in caplog.records
+        )
+
 
 # ---------------------------------------------------------------------------
 # PartitionInfo properties

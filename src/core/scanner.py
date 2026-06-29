@@ -222,6 +222,18 @@ class StorageScanner:
                 )
             )
 
+        # RECON 8.3.4 — quando a detecção de tipo de mídia falha totalmente
+        # (PowerShell ausente/restrito, timeout, JSON inválido), _detect_media_types
+        # retorna {} silenciosamente e TODOS os discos viram "Desconhecido". Sem
+        # este aviso, o INFO de sucesso abaixo mascararia a degradação. O WARNING
+        # chega à status bar via QtLogBridge (root logger, nível INFO captura WARNING).
+        if partitions and not media_map:
+            logger.warning(
+                "Detecção de tipo de disco indisponível — todos os discos marcados "
+                "como 'Desconhecido'. Sugestões de realocação por tipo de mídia "
+                "(NVMe/SSD/HDD) podem ficar imprecisas."
+            )
+
         logger.info("Partições mapeadas: %d encontradas.", len(partitions))
         return partitions
 

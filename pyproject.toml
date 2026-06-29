@@ -36,6 +36,13 @@ target-version = "py311"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# RECON 8.3.5 — segmentação de testes para feedback rápido (`pytest -m unit`).
+# Cada arquivo de teste declara `pytestmark = pytest.mark.unit|integration` no
+# topo do módulo. Marker não registrado emite PytestUnknownMarkWarning.
+markers = [
+    "unit: testes puros (mocks/tmp_path, sem I/O pesado, subprocess ou Qt widgets)",
+    "integration: real I/O, SQLite em disco, Qt widgets, threads, hashing SHA-256",
+]
 
 # ─────────────────────────────────────────────────────────────────────────
 # mypy — Sprint 7.6

@@ -39,5 +39,11 @@ jobs:
       - name: Type-check (mypy) — src/
         run: python -m mypy src/
 
-      - name: Testes (pytest)
-        run: python -m pytest tests/ -q
+      # RECON 8.3.5 — suíte segmentada: unitários primeiro (feedback rápido),
+      # integração depois. Se um unitário quebra, o job falha sem esperar os
+      # testes pesados (real I/O, Qt, hashing SHA-256).
+      - name: Testes unitários (rápido)
+        run: python -m pytest tests/ -m unit -q
+
+      - name: Testes de integração
+        run: python -m pytest tests/ -m integration -q
