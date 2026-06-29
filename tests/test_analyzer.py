@@ -674,3 +674,318 @@ class TestDuplicateDetectorWithCache:
         # Como os partial hashes diferem (no cache), Etapa 2 separa em grupos
         # de 1 arquivo cada → sample_candidates vazio → return [] cedo
         assert groups == []
+
+
+# ---------------------------------------------------------------------------
+# Testes de REGRESSÃO — Bug de gravidade ALTA em _best_sata_target e
+# _best_external_target (routing-target-validation).
+#
+# ESTES TESTES DEVEM FALHAR com o código atual — são a rede de segurança
+# para a correção que virá na próxima sessão.
+#
+# Três bugs codificados aqui:
+#   A) helper sugere disco sem espaço suficiente para o arquivo
+#   B) helper sugere o mesmo disco de origem como destino
+#   C) helper retorna default hardcoded ("D:" / "J:") quando disco não existe
+# ---------------------------------------------------------------------------
+
+_1GB_REG = 1024 ** 3  # alias local para não depender do import do módulo
+
+
+class TestRoutingTargetValidation:
+    """
+    Regressão: _best_sata_target e _best_external_target devem validar
+    (a) espaço disponível, (b) que destino ≠ origem, (c) que destino existe.
+    """
+
+    # ── Teste A: não sugere disco que não comporta o arquivo ─────────────────
+
+    def test_no_routing_suggestion_when_no_target_has_enough_space(self):
+        """
+        Bug A — Regra 1: se o único disco SATA tem menos espaço livre do que
+        o tamanho do arquivo, o motor NÃO deve emitir sugestão de MOVER.
+
+        Comportamento atual (ERRADO): _best_sata_target escolhe D: (maior
+        free_bytes entre os candidatos) e o motor emite a sugestão mesmo com
+        D: tendo só 200 MB livres para um arquivo de 2 GB.
+        """
+        _200MB = 200 * 1024 * 1024
+        file_size = 2 * _1GB_REG  # 2 GB — não cabe em 200 MB
+
+        partitions = [
+            PartitionInfo(
+                letter="C:", fstype="NTFS",
+                total_bytes=1000 * _1GB_REG, used_bytes=940 * _1GB_REG,
+                free_bytes=60 * _1GB_REG, percent_used=94.0,
+            ),
+            PartitionInfo(
+                letter="D:", fstype="NTFS",
+                total_bytes=500 * _1GB_REG,
+                used_bytes=500 * _1GB_REG - _200MB,
+                free_bytes=_200MB,
+                percent_used=99.9,
+            ),
+        ]
+        engine = SmartRulesEngine(
+            nvme_letters={"C:"},
+            sata_internal_letters={"D:"},
+            external_letters=set(),
+        )
+        file = FileEntry(
+            path="C:\\Users\\jeff\\filme.mkv",
+            size_bytes=file_size,
+            category="Vídeos",
+        )
+
+        suggestions = engine.evaluate(file, partitions)
+        r1 = [s for s in suggestions if s.rule_id == 1]
+
+        # DEVE ser vazio: nenhum SATA comporta 2 GB
+        assert len(r1) == 0, (
+            f"Não deve sugerir mover {file_size // _1GB_REG} GB para D: "
+            f"com apenas {_200MB // (1024 ** 2)} MB livres. "
+            f"Sugestões geradas: {r1}"
+        )
+
+    def test_no_routing_suggestion_when_external_target_has_no_space(self):
+        """
+        Bug A — Regra 3: se o único disco externo tem menos espaço livre do
+        que o arquivo, o motor NÃO deve emitir sugestão de MOVER.
+
+        Comportamento atual (ERRADO): _best_external_target retorna J: (único
+        candidato) e o motor emite sugestão com destino insuficiente.
+        """
+        _50MB = 50 * 1024 * 1024
+        file_size = 500 * 1024 * 1024  # 500 MB — não cabe em 50 MB
+
+        partitions = [
+            PartitionInfo(
+                letter="C:", fstype="NTFS",
+                total_bytes=1000 * _1GB_REG, used_bytes=940 * _1GB_REG,
+                free_bytes=60 * _1GB_REG, percent_used=94.0,
+            ),
+            PartitionInfo(
+                letter="J:", fstype="NTFS",
+                total_bytes=3000 * _1GB_REG,
+                used_bytes=3000 * _1GB_REG - _50MB,
+                free_bytes=_50MB,
+                percent_used=99.9,
+            ),
+        ]
+        engine = SmartRulesEngine(
+            nvme_letters={"C:"},
+            sata_internal_letters=set(),
+            external_letters={"J:"},
+        )
+        file = FileEntry(
+            path="C:\\fotos.zip",
+            size_bytes=file_size,
+            category="Compactados",
+        )
+
+        suggestions = engine.evaluate(file, partitions)
+        r3 = [s for s in suggestions if s.rule_id == 3]
+
+        assert len(r3) == 0, (
+            f"Não deve sugerir mover {file_size // (1024 ** 2)} MB para J: "
+            f"com apenas {_50MB // (1024 ** 2)} MB livres. "
+            f"Sugestões geradas: {r3}"
+        )
+
+    # ── Teste B: não sugere o mesmo disco de origem como destino ─────────────
+
+    def test_no_routing_suggestion_when_target_equals_source_disk(self):
+        """
+        Bug B — Regra 3: quando o único disco externo disponível É o mesmo
+        disco de origem (cheio), o motor NÃO deve sugerir mover para ele mesmo.
+
+        Cenário: arquivo em J: (93% cheio, categoria Vídeos). Único candidato
+        externo é J:. _best_external_target devolve "J:" como destino.
+
+        Comportamento atual (ERRADO): ReallocationSuggestion é emitida com
+        target_disk="J:" == file_drive="J:".
+        """
+        partitions = [
+            PartitionInfo(
+                letter="J:", fstype="NTFS",
+                total_bytes=3000 * _1GB_REG,
+                used_bytes=2790 * _1GB_REG,
+                free_bytes=210 * _1GB_REG,
+                percent_used=93.0,
+            ),
+        ]
+        engine = SmartRulesEngine(
+            nvme_letters=set(),
+            sata_internal_letters=set(),
+            external_letters={"J:"},
+        )
+        file = FileEntry(
+            path="J:\\series\\temporada.mkv",
+            size_bytes=100 * 1024 * 1024,
+            category="Vídeos",
+        )
+
+        suggestions = engine.evaluate(file, partitions)
+        r3 = [s for s in suggestions if s.rule_id == 3]
+
+        # Nenhuma sugestão OU (se houver) o destino não pode ser J:
+        same_disk_suggestions = [s for s in r3 if s.target_disk == "J:"]
+        assert len(same_disk_suggestions) == 0, (
+            "Não deve sugerir mover de J: para J: (origem == destino). "
+            f"Sugestões geradas: {r3}"
+        )
+
+    # ── Teste C: não retorna disco inexistente (default hardcoded) ────────────
+
+    def test_no_routing_suggestion_when_sata_target_does_not_exist(self):
+        """
+        Bug C — Regra 1: quando nenhum disco de sata_internal_letters existe
+        no partition_map, o motor NÃO deve emitir sugestão com target_disk
+        fabricado (ex: "D:").
+
+        Comportamento atual (ERRADO): _best_sata_target inicializa best="D:"
+        e retorna "D:" mesmo sem D: no partition_map. O motor emite sugestão
+        com um destino que não existe.
+        """
+        # partition_map sem D: nem G: — apenas C: e J:
+        partitions = [
+            PartitionInfo(
+                letter="C:", fstype="NTFS",
+                total_bytes=1000 * _1GB_REG, used_bytes=940 * _1GB_REG,
+                free_bytes=60 * _1GB_REG, percent_used=94.0,
+            ),
+            PartitionInfo(
+                letter="J:", fstype="NTFS",
+                total_bytes=3000 * _1GB_REG, used_bytes=900 * _1GB_REG,
+                free_bytes=2100 * _1GB_REG, percent_used=30.0,
+            ),
+        ]
+        engine = SmartRulesEngine(
+            nvme_letters={"C:"},
+            sata_internal_letters={"D:", "G:"},  # nem D: nem G: existem
+            external_letters={"J:"},
+        )
+        file = FileEntry(
+            path="C:\\Users\\jeff\\filme.mkv",
+            size_bytes=2 * _1GB_REG,
+            category="Vídeos",
+        )
+
+        suggestions = engine.evaluate(file, partitions)
+        r1 = [s for s in suggestions if s.rule_id == 1]
+
+        assert len(r1) == 0, (
+            "Não deve emitir sugestão quando nenhum disco SATA candidato "
+            f"existe no partition_map. target_disk gerado: "
+            f"{[s.target_disk for s in r1]}"
+        )
+
+    def test_no_routing_suggestion_when_external_target_does_not_exist(self):
+        """
+        Bug C — Regra 3: quando nenhum disco de external_letters existe no
+        partition_map, o motor NÃO deve emitir sugestão com "J:" fabricado.
+
+        Comportamento atual (ERRADO): _best_external_target retorna "J:" mesmo
+        sem J: ou L: no partition_map.
+        """
+        # Apenas C: — sem nenhum disco externo montado
+        partitions = [
+            PartitionInfo(
+                letter="C:", fstype="NTFS",
+                total_bytes=1000 * _1GB_REG, used_bytes=940 * _1GB_REG,
+                free_bytes=60 * _1GB_REG, percent_used=94.0,
+            ),
+        ]
+        engine = SmartRulesEngine(
+            nvme_letters={"C:"},
+            sata_internal_letters=set(),
+            external_letters={"J:", "L:"},  # nem J: nem L: existem
+        )
+        file = FileEntry(
+            path="C:\\fotos.zip",
+            size_bytes=500 * 1024 * 1024,
+            category="Compactados",
+        )
+
+        suggestions = engine.evaluate(file, partitions)
+        r3 = [s for s in suggestions if s.rule_id == 3]
+
+        assert len(r3) == 0, (
+            "Não deve emitir sugestão quando nenhum disco externo candidato "
+            f"existe no partition_map. target_disk gerado: "
+            f"{[s.target_disk for s in r3]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Sprint 6.4 — Áudio e Modelos de IA passam pelas regras R1 e R3
+# ---------------------------------------------------------------------------
+
+class TestRule1AudioAndAIModels:
+    """R1 (mídia pesada >1GB no NVMe) agora cobre áudio e modelos de IA."""
+
+    def test_triggers_for_large_gguf_on_c(self, fake_partitions):
+        engine = SmartRulesEngine()
+        file = FileEntry(
+            path="C:\\Users\\jeff\\models\\llama3-70b.gguf",
+            size_bytes=40 * _1GB,
+            category="Modelos IA",
+        )
+        suggestions = engine.evaluate(file, fake_partitions)
+        r1 = [s for s in suggestions if s.rule_id == 1]
+
+        assert len(r1) == 1
+        assert r1[0].action == "MOVER"
+        assert r1[0].target_disk in {"D:", "G:"}
+
+    def test_triggers_for_large_flac_on_c(self, fake_partitions):
+        engine = SmartRulesEngine()
+        file = FileEntry(
+            path="C:\\Users\\jeff\\Music\\album-lossless.flac",
+            size_bytes=2 * _1GB,
+            category="Áudio",
+        )
+        suggestions = engine.evaluate(file, fake_partitions)
+        r1 = [s for s in suggestions if s.rule_id == 1]
+        assert len(r1) == 1
+
+    def test_small_audio_does_not_trigger(self, fake_partitions):
+        engine = SmartRulesEngine()
+        file = FileEntry(
+            path="C:\\Users\\jeff\\Music\\musica.mp3",
+            size_bytes=8 * 1024 * 1024,  # 8 MB < 1 GB
+            category="Áudio",
+        )
+        suggestions = engine.evaluate(file, fake_partitions)
+        r1 = [s for s in suggestions if s.rule_id == 1]
+        assert len(r1) == 0
+
+
+class TestRule3AudioAndAIModels:
+    """R3 (disco >90% + mídia) agora cobre as categorias Áudio e Modelos IA."""
+
+    def test_triggers_for_audio_on_full_disk(self, fake_partitions):
+        engine = SmartRulesEngine()
+        file = FileEntry(
+            path="C:\\Users\\jeff\\Music\\set.wav",
+            size_bytes=300 * 1024 * 1024,
+            category="Áudio",
+        )
+        suggestions = engine.evaluate(file, fake_partitions)
+        r3 = [s for s in suggestions if s.rule_id == 3]
+
+        assert len(r3) == 1
+        assert r3[0].target_disk == "J:"  # externo com mais espaço
+
+    def test_triggers_for_ai_model_on_full_disk(self, fake_partitions):
+        engine = SmartRulesEngine()
+        file = FileEntry(
+            path="C:\\models\\mistral.safetensors",
+            size_bytes=15 * _1GB,
+            category="Modelos IA",
+        )
+        suggestions = engine.evaluate(file, fake_partitions)
+        r3 = [s for s in suggestions if s.rule_id == 3]
+
+        assert len(r3) == 1
+        assert r3[0].target_disk == "J:"
