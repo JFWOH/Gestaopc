@@ -1,7 +1,7 @@
 # Gerenciador de PC — Storage Manager
 
 ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)
-![PyQt6](https://img.shields.io/badge/GUI-PyQt6-41CD52?logo=qt&logoColor=white)
+![PySide6](https://img.shields.io/badge/GUI-PySide6-41CD52?logo=qt&logoColor=white)
 ![Windows](https://img.shields.io/badge/OS-Windows%2011-0078D4?logo=windows&logoColor=white)
 ![Status](https://img.shields.io/badge/Status-Em%20Desenvolvimento-FFD600)
 
@@ -10,14 +10,16 @@ Sistema inteligente de gerenciamento de armazenamento para Windows 11, com inter
 ## ✨ Funcionalidades
 
 - **Mapeamento de Discos** — Detecta automaticamente todas as partições, tipo de mídia (NVMe/SSD/HDD), espaço usado/livre
-- **Top 50 Maiores Arquivos** — Varredura inteligente com categorização automática (Vídeos, Imagens, Documentos, Executáveis, Compactados)
-- **Top 20 Pastas Mais Pesadas** — Identifica os diretórios que mais consomem espaço
-- **Detecção de Duplicatas** — Algoritmo eficiente em 3 etapas (tamanho → hash parcial → hash SHA-256 completo)
-- **Motor de Regras IA** — Sugestões de realocação baseadas em regras:
-  - R1: Mídia pesada (>1GB) no NVMe → mover para SATA
+- **Top 50 Maiores Arquivos** — Varredura inteligente com categorização automática (Vídeos, Áudio, Imagens, Documentos, Executáveis, Compactados, Modelos IA)
+- **Top 20 Pastas Mais Pesadas** — Soma recursiva completa do tamanho de cada diretório
+- **Detecção de Duplicatas** — Algoritmo eficiente em 3 etapas (tamanho → hash parcial → hash SHA-256 completo), com cache de hashes
+- **Motor de Regras** — Sugestões de realocação com validação de destino (espaço suficiente, origem ≠ destino, disco existente):
+  - R1: Mídia pesada (>1GB) no NVMe — vídeo, áudio, modelos de IA → mover para SATA
   - R2: Arquivos duplicados → sugerir deleção da cópia mais recente
   - R3: Disco >90% cheio → mover mídia para discos externos
-- **Execução Segura** — Movimentação/deleção via Lixeira, com undo e log completo
+- **Assistente IA (Ollama)** — Chat local com tool-calling: 13 ferramentas (leitura + execução) protegidas por tokens de confirmação one-shot
+- **Servidor MCP** — Expõe as mesmas ferramentas a clientes LLM externos (ex.: Claude Desktop)
+- **Execução Segura** — Movimentação/deleção via Lixeira, com undo e histórico persistente em SQLite
 - **Gráficos Visuais** — Donut chart de uso de disco + barras por categoria
 - **System Tray** — Minimiza para bandeja com acesso rápido
 
@@ -29,21 +31,31 @@ gestaopc/
 │   ├── core/                    # Lógica de negócio
 │   │   ├── scanner.py           # Mapeamento de discos + varredura (3.1, 3.2)
 │   │   ├── analyzer.py          # Duplicatas + motor de regras (3.3, 3.4)
-│   │   └── executor.py          # Operações seguras de arquivo + QThread
-│   ├── gui/                     # Interface gráfica PyQt6
+│   │   ├── executor.py          # Operações seguras de arquivo + QThread
+│   │   ├── hash_cache.py        # Cache in-memory de hashes (parcial/completo)
+│   │   ├── storage_db.py        # Persistência SQLite (settings, índice, histórico)
+│   │   ├── path_guard.py        # Validação/sanitização de caminhos
+│   │   ├── config.py            # Single-source-of-truth de constantes
+│   │   ├── telemetry.py         # Telemetria local JSONL (opt-in)
+│   │   ├── ai_toolbelt.py       # 13 tools para Ollama + MCP (tokens one-shot)
+│   │   ├── ollama_client.py     # Cliente HTTP do servidor Ollama local
+│   │   └── skills_loader.py     # Loader de perfis RAG (skills/*.md)
+│   ├── gui/                     # Interface gráfica PySide6 (Qt6)
 │   │   ├── main_window.py       # Janela principal (6 abas)
+│   │   ├── assistant_tab.py     # Aba do assistente IA (loop agente Ollama)
 │   │   ├── charts.py            # Gráficos donut + barras (QPainter)
 │   │   ├── icon.py              # Ícone programático + system tray
 │   │   ├── styles.py            # Design system (cores, fontes, QSS)
-│   │   └── workers.py           # QThreads para I/O sem bloquear GUI
-│   └── main.py                  # Ponto de entrada alternativo
-├── tests/                       # Testes unitários (pytest)
-│   ├── conftest.py              # Fixtures compartilhadas
-│   ├── test_scanner.py          # Testes do scanner
-│   ├── test_analyzer.py         # Testes de duplicatas + regras
-│   └── test_executor.py         # Testes do executor
-├── specs/                       # Especificações técnicas
-│   └── 01-storage-manager.md    # Spec principal do módulo
+│   │   ├── log_bridge.py        # Logging Python → Qt Signal (thread-safe)
+│   │   ├── scan_status_panel.py # Painel de progresso de varredura
+│   │   ├── workers.py           # QThreads para I/O sem bloquear a GUI
+│   │   └── tabs/                # overview, top_files, top_dirs,
+│   │                            #   duplicates, suggestions, history
+│   └── main.py                  # Ponto de entrada (QApplication + MainWindow)
+├── tests/                       # Suíte pytest (572 testes)
+├── specs/                       # Especificações técnicas (spec-driven)
+├── skills/                      # Perfis RAG do assistente (.md)
+├── .github/workflows/ci.yml     # CI: ruff + mypy + pytest (windows-latest)
 ├── run_gui.py                   # Launcher da GUI
 └── pyproject.toml               # Configuração do projeto
 ```
@@ -85,11 +97,15 @@ Com varredura automática ao iniciar:
 python run_gui.py --auto-scan
 ```
 
-### Testes
+### Testes e qualidade
 
 ```bash
-python -m pytest tests/ -v
+python -m pytest tests/ -v     # suíte completa (572 testes)
+python -m ruff check .         # lint
+python -m mypy src/            # type-check
 ```
+
+> Os mesmos comandos rodam na CI (GitHub Actions) a cada push/PR.
 
 ### Self-test do módulo analyzer
 
@@ -119,12 +135,16 @@ Interface inspirada no **ASUS AI Suite 3**:
 | Componente | Tecnologia |
 |---|---|
 | Linguagem | Python 3.11+ |
-| GUI | PyQt6 |
+| GUI | PySide6 (Qt6, LGPL) |
 | Gráficos | QPainter (puro Qt, sem dependências) |
 | Disco | psutil + PowerShell (Get-PhysicalDisk) |
 | Deleção Segura | send2trash |
+| IA local | Ollama (HTTP) |
+| Integração LLM | MCP (Model Context Protocol) |
+| Persistência | SQLite |
 | Testes | pytest |
-| Lint | ruff |
+| Lint / Tipos | ruff + mypy |
+| CI | GitHub Actions |
 
 ## 📋 Especificação
 
