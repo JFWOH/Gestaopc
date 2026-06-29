@@ -91,6 +91,7 @@ module = [
     "src.core.hash_cache",
     "src.core.telemetry",
     "src.core.skills_loader",
+    "src.core.ai_backend",
 ]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true

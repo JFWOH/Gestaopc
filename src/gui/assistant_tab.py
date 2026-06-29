@@ -37,6 +37,7 @@ from src.core.config import (
     WORKER_QUIT_TIMEOUT_MS,
     WORKER_RESTART_TIMEOUT_MS,
 )
+from src.core.ai_backend import AIBackend
 from src.core.ollama_client import OllamaClient
 from src.core.skills_loader import Skill, load_skills
 from src.core.storage_db import StorageManagerDB, get_default_db_path
@@ -108,12 +109,15 @@ class OllamaAgentWorker(QThread):
         messages: list[dict],
         tools: list[dict],
         parent=None,
+        backend: AIBackend | None = None,
     ):
         super().__init__(parent)
         self.model = model
         self.messages = messages
         self.tools = tools
-        self._client = OllamaClient()
+        # RECON 8.4 — backend injetável (default Ollama). O AssistantTab passa
+        # seu próprio backend; default preserva instanciações existentes/testes.
+        self._client: AIBackend = backend if backend is not None else OllamaClient()
 
     def run(self):
         for event in self._client.chat_with_tools(
@@ -185,9 +189,12 @@ class AssistantTab(QWidget):
     _WORKER_QUIT_TIMEOUT_MS: int = WORKER_QUIT_TIMEOUT_MS
     _WORKER_CLEANUP_TIMEOUT_MS: int = WORKER_CLEANUP_TIMEOUT_MS
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, backend: AIBackend | None = None):
         super().__init__(parent)
-        self._client = OllamaClient()
+        # RECON 8.4 — backend de IA injetável (default Ollama). Propagado ao
+        # OllamaAgentWorker, permitindo trocar Ollama por outro backend sem
+        # alterar esta GUI.
+        self._client: AIBackend = backend if backend is not None else OllamaClient()
         # Optional: definido como None no closeEvent (cleanup do SQLite).
         self._db: StorageManagerDB | None = StorageManagerDB(get_default_db_path())
         self._db.initialize()
@@ -601,7 +608,9 @@ class AssistantTab(QWidget):
         # mas se o usuário spam-clicar antes da resposta, evita acúmulo de threads.
         self._stop_active_worker(timeout_ms=WORKER_RESTART_TIMEOUT_MS)
 
-        self._worker = OllamaAgentWorker(model, self._messages, tools, self)
+        self._worker = OllamaAgentWorker(
+            model, self._messages, tools, self, backend=self._client
+        )
         self._worker.tool_call_started.connect(self._on_tool_call_started)
         self._worker.tool_call_finished.connect(self._on_tool_call_finished)
         self._worker.text_received.connect(self._on_agent_text)
