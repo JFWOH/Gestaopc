@@ -79,6 +79,11 @@ class FullScanWorker(QThread):
     progress_percent = Signal(int)
     progress_indeterminate = Signal(bool)
     finished_result = Signal(object)  # ScanResult
+    # Resultado PRELIMINAR emitido logo após a Etapa 2 (listagem), antes da
+    # detecção de duplicatas (lenta). Carrega partitions/top_files/top_dirs;
+    # duplicates/suggestions ainda vazios. Permite popular as abas em segundos
+    # em vez de esperar minutos pela fase de hash SHA-256.
+    partial_result = Signal(object)  # ScanResult parcial
 
     # Sprint 7.1 — Painel de status por disco
     partitions_detected = Signal(list)         # list[PartitionInfo] varredores
@@ -222,28 +227,38 @@ class FullScanWorker(QThread):
             if self._abort:
                 return
 
-            # ── Etapa 3: Detectar duplicatas ────────────────────────
-            # Esta etapa pode rodar 5–15 minutos em discos grandes (hash SHA-256
-            # completo). A barra de progresso entra em modo indeterminado para
-            # comunicar atividade sem sugerir tempo restante mensurável.
-            dup_msg = (
-                "Comparando duplicatas (hash SHA-256, pode demorar varios minutos)..."
-            )
-            self.progress.emit(dup_msg)
-            self.global_stage_changed.emit(dup_msg)
-            self.progress_percent.emit(65)
-            self.progress_indeterminate.emit(True)
-
-            # Sprint 7.4: hidratar cache de hash a partir do DB. Arquivos cujo
-            # path JÁ está em file_index com size/mtime idênticos podem reusar
-            # os hashes computados em scans anteriores, transformando re-scans
-            # de 13+ minutos em segundos.
+            # ── Persistência antecipada + abas preliminares ─────────────
+            # Bug fix: antes, as abas e o file_index só eram preenchidos no FIM,
+            # depois da detecção de duplicatas (hash SHA-256 — minutos a >1h em
+            # discos grandes). Quem fechasse o app antes do fim ficava com abas
+            # vazias e índice desatualizado. Agora persistimos os arquivos e
+            # emitimos um resultado PARCIAL aqui: as abas de arquivos/pastas
+            # aparecem em segundos; duplicatas e sugestões chegam depois.
+            #
+            # Sprint 7.4: o cache de hash é hidratado ANTES da persistência para
+            # não sobrescrever hashes válidos do DB com None (re-scans reusam
+            # hashes de scans anteriores; arquivos novos ficam sem hash até a
+            # Etapa 3 computá-los).
             hash_cache = self._build_hash_cache(all_files, db)
             logger.info(
                 "Hash cache hidratado: %d hashes parciais e %d hashes completos.",
                 hash_cache.partial_count,
                 hash_cache.full_count,
             )
+            self._persist_file_index(db, result.top_files, hash_cache)
+            self.partial_result.emit(result)
+            self.progress.emit("Arquivos listados — detectando duplicatas...")
+
+            # ── Etapa 3: Detectar duplicatas ────────────────────────
+            # Esta etapa pode rodar 5–15 minutos (ou mais) em discos grandes
+            # (hash SHA-256 completo). A barra entra em modo indeterminado para
+            # comunicar atividade sem sugerir tempo restante mensurável.
+            dup_msg = (
+                "Comparando duplicatas (hash SHA-256, pode demorar varios minutos)..."
+            )
+            self.global_stage_changed.emit(dup_msg)
+            self.progress_percent.emit(65)
+            self.progress_indeterminate.emit(True)
 
             detector = DuplicateDetector()
             try:
@@ -293,23 +308,11 @@ class FullScanWorker(QThread):
                     created_at=time.time()
                 )
             
-            # Sprint 7.4: persistir top_files COM os hashes do cache. Em re-scans,
-            # os hashes vêm seedados do DB e voltam intactos; em arquivos novos
-            # ou modificados, vêm computados na Etapa 3.
-            now = time.time()
-            for f in result.top_files:
-                drive_letter = f.path[:2] if len(f.path) >= 2 and f.path[1] == ':' else None
-                db.upsert_file_index(
-                    path=f.path,
-                    disk_letter=drive_letter,
-                    size_bytes=f.size_bytes,
-                    mtime=f.modified_time,
-                    category=f.category,
-                    partial_hash=hash_cache.get_partial(f.path),
-                    full_hash=hash_cache.get_full(f.path),
-                    last_seen=now,
-                )
-                
+            # Sprint 7.4: re-persistir top_files agora COM os full-hashes que a
+            # Etapa 3 computou (a persistência antecipada gravou os arquivos sem
+            # os full-hashes ainda inexistentes). upsert idempotente.
+            self._persist_file_index(db, result.top_files, hash_cache)
+
             logger.info("Sugestoes geradas: %d.", len(result.suggestions))
 
             self.progress_percent.emit(100)
@@ -336,6 +339,30 @@ class FullScanWorker(QThread):
             self.finished_result.emit(result)
 
     # ---- Helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _persist_file_index(db, files, cache) -> None:
+        """
+        Faz upsert dos arquivos no file_index, gravando os hashes disponíveis
+        no cache (seedados do DB ou recém-computados). Chamado duas vezes por
+        varredura: cedo (após Etapa 2, hashes parciais/None) e ao final (com os
+        full-hashes da Etapa 3). upsert idempotente — a 2ª chamada só enriquece.
+        """
+        now = time.time()
+        for f in files:
+            drive_letter = (
+                f.path[:2] if len(f.path) >= 2 and f.path[1] == ":" else None
+            )
+            db.upsert_file_index(
+                path=f.path,
+                disk_letter=drive_letter,
+                size_bytes=f.size_bytes,
+                mtime=f.modified_time,
+                category=f.category,
+                partial_hash=cache.get_partial(f.path),
+                full_hash=cache.get_full(f.path),
+                last_seen=now,
+            )
 
     # Tolerância em segundos ao comparar mtime do filesystem com o cacheado.
     # Sprint 7.6: valor canônico em config.HASH_CACHE_MTIME_TOLERANCE.

@@ -317,8 +317,28 @@ class MainWindow(QMainWindow):
         self._scan_worker.global_stage_changed.connect(
             self._scan_status_panel.set_global_stage
         )
+        self._scan_worker.partial_result.connect(self._on_scan_partial)
         self._scan_worker.finished_result.connect(self._on_scan_finished)
         self._scan_worker.start()
+
+    def _on_scan_partial(self, result: ScanResult) -> None:
+        """
+        Resultado PRELIMINAR (pós-listagem, antes da detecção de duplicatas).
+
+        Popula imediatamente as abas que já têm dados — Visão Geral, Maiores
+        Arquivos e Maiores Pastas — para o usuário não esperar a fase lenta de
+        duplicatas. As abas Duplicatas e Sugestões são preenchidas depois, em
+        _on_scan_finished. A varredura continua em background ("Varrendo...").
+        """
+        self._last_result = result
+        self._overview_tab.populate(result)
+        self._top_files_tab.populate(result)
+        self._top_dirs_tab.populate(result)
+        self.status_bar.showMessage(
+            f"{len(result.top_files)} maiores arquivos listados  |  "
+            f"{len(result.top_dirs)} pastas  |  "
+            "detectando duplicatas em segundo plano..."
+        )
 
     def _on_scan_finished(self, result: ScanResult) -> None:
         """Chamado quando a varredura termina — delega populate() a cada aba."""
