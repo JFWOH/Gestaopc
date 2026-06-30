@@ -534,6 +534,42 @@ class StorageManagerDB:
                 ),
             )
 
+    def upsert_file_index_many(
+        self, rows: list[tuple[str, str | None, int, float, str | None,
+                               str | None, str | None, float]]
+    ) -> int:
+        """
+        E4 (Sprint de Escala): upsert em LOTE no file_index, numa única
+        transação (executemany), em vez de um commit/fsync por arquivo.
+
+        Cada tupla: (path, disk_letter, size_bytes, mtime, category,
+        partial_hash, full_hash, last_seen). Retorna o nº de linhas processadas.
+
+        Necessário porque E4 passa a persistir TODO o conjunto varrido (não só
+        o top-50), o que tornaria o upsert linha-a-linha custoso.
+        """
+        if not rows:
+            return 0
+        with self._db:
+            self._db.executemany(
+                """
+                INSERT INTO file_index (
+                    path, disk_letter, size_bytes, mtime,
+                    category, partial_hash, full_hash, last_seen
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                    disk_letter  = excluded.disk_letter,
+                    size_bytes   = excluded.size_bytes,
+                    mtime        = excluded.mtime,
+                    category     = excluded.category,
+                    partial_hash = excluded.partial_hash,
+                    full_hash    = excluded.full_hash,
+                    last_seen    = excluded.last_seen
+                """,
+                rows,
+            )
+        return len(rows)
+
     def get_file_index(self, path: str) -> sqlite3.Row | None:
         """Retorna a entrada do índice para um caminho, ou None."""
         return self._db.execute(

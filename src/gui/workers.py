@@ -245,7 +245,7 @@ class FullScanWorker(QThread):
                 hash_cache.partial_count,
                 hash_cache.full_count,
             )
-            self._persist_file_index(db, result.top_files, hash_cache)
+            self._persist_file_index(db, all_files, hash_cache)
             self.partial_result.emit(result)
             self.progress.emit("Arquivos listados — detectando duplicatas...")
 
@@ -311,7 +311,7 @@ class FullScanWorker(QThread):
             # Sprint 7.4: re-persistir top_files agora COM os full-hashes que a
             # Etapa 3 computou (a persistência antecipada gravou os arquivos sem
             # os full-hashes ainda inexistentes). upsert idempotente.
-            self._persist_file_index(db, result.top_files, hash_cache)
+            self._persist_file_index(db, all_files, hash_cache)
 
             logger.info("Sugestoes geradas: %d.", len(result.suggestions))
 
@@ -343,26 +343,31 @@ class FullScanWorker(QThread):
     @staticmethod
     def _persist_file_index(db, files, cache) -> None:
         """
-        Faz upsert dos arquivos no file_index, gravando os hashes disponíveis
-        no cache (seedados do DB ou recém-computados). Chamado duas vezes por
-        varredura: cedo (após Etapa 2, hashes parciais/None) e ao final (com os
-        full-hashes da Etapa 3). upsert idempotente — a 2ª chamada só enriquece.
+        Faz upsert dos arquivos no file_index (em LOTE, uma transação), gravando
+        os hashes disponíveis no cache (seedados do DB ou recém-computados).
+        Chamado duas vezes por varredura: cedo (após Etapa 2, sem full-hashes) e
+        ao final (com os full-hashes da Etapa 3). upsert idempotente — a 2ª
+        chamada só enriquece.
+
+        E4: recebe TODO o conjunto varrido (all_files), não só o top-50 da GUI,
+        para que as tools da IA (list_file_index, find_duplicates_from_index)
+        enxerguem um universo útil de arquivos.
         """
         now = time.time()
-        for f in files:
-            drive_letter = (
-                f.path[:2] if len(f.path) >= 2 and f.path[1] == ":" else None
+        rows = [
+            (
+                f.path,
+                f.path[:2] if len(f.path) >= 2 and f.path[1] == ":" else None,
+                f.size_bytes,
+                f.modified_time,
+                f.category,
+                cache.get_partial(f.path),
+                cache.get_full(f.path),
+                now,
             )
-            db.upsert_file_index(
-                path=f.path,
-                disk_letter=drive_letter,
-                size_bytes=f.size_bytes,
-                mtime=f.modified_time,
-                category=f.category,
-                partial_hash=cache.get_partial(f.path),
-                full_hash=cache.get_full(f.path),
-                last_seen=now,
-            )
+            for f in files
+        ]
+        db.upsert_file_index_many(rows)
 
     # Tolerância em segundos ao comparar mtime do filesystem com o cacheado.
     # Sprint 7.6: valor canônico em config.HASH_CACHE_MTIME_TOLERANCE.

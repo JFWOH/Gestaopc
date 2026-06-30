@@ -448,6 +448,29 @@ def test_upsert_file_index_updates_hash(db, tmp_path):
     assert row["last_seen"] == 2000.0
 
 
+def test_upsert_file_index_many_inserts_and_updates(db):
+    """E4: upsert em lote insere e, na 2ª chamada, atualiza (enriquece hash)."""
+    rows = [
+        ("G:/a.iso", "G:", 1000, 10.0, "Compactados", None, None, 1.0),
+        ("G:/b.iso", "G:", 2000, 20.0, "Compactados", None, None, 1.0),
+    ]
+    assert db.upsert_file_index_many(rows) == 2
+    assert {r["path"] for r in db.list_file_index(limit=100)} == {"G:/a.iso", "G:/b.iso"}
+    assert db.get_file_index("G:/a.iso")["full_hash"] is None
+
+    # 2ª chamada: mesmo path 'a' com full_hash → enriquece sem duplicar.
+    db.upsert_file_index_many(
+        [("G:/a.iso", "G:", 1000, 10.0, "Compactados", "p", "FULLHASH", 2.0)]
+    )
+    assert len(db.list_file_index(limit=100)) == 2
+    assert db.get_file_index("G:/a.iso")["full_hash"] == "FULLHASH"
+
+
+def test_upsert_file_index_many_empty_is_noop(db):
+    assert db.upsert_file_index_many([]) == 0
+    assert db.list_file_index(limit=10) == []
+
+
 # ===========================================================================
 # 16. Remover entrada de file_index
 # ===========================================================================
