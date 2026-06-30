@@ -154,6 +154,16 @@ _DDL_STATEMENTS: list[str] = [
         created_at      REAL    NOT NULL
     )
     """,
+    # E7 (Sprint de Escala): índices secundários. Sem eles, as consultas da IA
+    # e da GUI faziam full scan + sort no file_index — irrelevante com ~50 linhas,
+    # mas crítico quando o índice cresce (E4). CREATE INDEX IF NOT EXISTS é
+    # idempotente (migração transparente para bancos existentes).
+    "CREATE INDEX IF NOT EXISTS idx_file_index_size ON file_index(size_bytes DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_file_index_full_hash ON file_index(full_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_file_index_disk ON file_index(disk_letter)",
+    "CREATE INDEX IF NOT EXISTS idx_file_index_category ON file_index(category)",
+    "CREATE INDEX IF NOT EXISTS idx_operation_history_ts ON operation_history(timestamp DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_suggestions_filter ON suggestions(dismissed, created_at DESC)",
 ]
 
 

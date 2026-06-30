@@ -121,6 +121,25 @@ def test_operation_history_has_dry_run_column(db):
     assert "content_hash" in cols
 
 
+def test_secondary_indexes_exist(db):
+    """E7: índices secundários criados (idempotentes)."""
+    indexes = {
+        row[0]
+        for row in db._db.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        ).fetchall()
+    }
+    expected = {
+        "idx_file_index_size",
+        "idx_file_index_full_hash",
+        "idx_file_index_disk",
+        "idx_file_index_category",
+        "idx_operation_history_ts",
+        "idx_suggestions_filter",
+    }
+    assert expected.issubset(indexes), f"faltando: {expected - indexes}"
+
+
 # ===========================================================================
 # 2. initialize() idempotente
 # ===========================================================================
