@@ -1,144 +1,199 @@
 Relatório Técnico Completo — GestaoPC Storage Manager
-Versão: 0.3.0 · Python: 3.11+ · Plataforma: Windows 11
-Atualizado em: 2026-05-08
+Versão: 0.3.0 · Python: 3.11+ · GUI: PySide6 6.x (Qt 6) · Plataforma: Windows 11
+Atualizado em: 2026-06-30
+Estado: Em desenvolvimento ativo · 610 testes verdes · ruff clean · mypy 0 erros (32 arquivos) · CI ativo
+
+====================================================================
+0. SUMÁRIO DE ESTADO (snapshot atual)
+====================================================================
+- 17 arquivos de teste, 610 testes passando (segmentados: `pytest -m unit` / `-m integration`).
+- Qualidade travada por CI (GitHub Actions, windows-latest): ruff + mypy + pytest.
+- Distribuível como app autônomo Windows via PyInstaller --onedir (LGPL-compliant).
+- Postura de segurança reforçada: Sprint de Hardening (S5–S10) concluído em 2026-06-30.
+- Núcleo de IA desacoplado por Protocol (AIBackend); superfície de tools com whitelist
+  e aprovação humana fora da banda.
 
 ====================================================================
 1. VISÃO GERAL
 ====================================================================
-O GestaoPC Storage Manager é um aplicativo desktop avançado para gerenciamento de armazenamento otimizado para Windows 11. Ele mapeia discos físicos e lógicos de forma automática, detecta duplicatas com verificação criptográfica e sugere ações de realocação usando um Motor de Regras.
+O GestaoPC Storage Manager é um aplicativo desktop para gerenciamento e otimização de
+armazenamento no Windows 11. Mapeia discos físicos e lógicos, detecta duplicatas com
+verificação criptográfica (SHA-256), e sugere realocações via um Motor de Regras simbólico.
 
-O aplicativo evoluiu de um sistema estritamente transitório para um ecossistema com base de dados persistente em SQLite, ganhou a capacidade de ser manipulado por Inteligências Artificiais externas via Servidor MCP (Model Context Protocol) e passou a contar com um Assistente IA Local integrado via Ollama.
+Possui base de dados persistente em SQLite, pode ser operado por IAs externas via Servidor
+MCP (Model Context Protocol) e conta com um Assistente IA Local integrado via Ollama
+(tool-calling). Ações que movem/deletam arquivos são protegidas por path guard, tokens de
+confirmação com binding criptográfico, rate-limit e — na GUI — aprovação humana explícita.
 
 ====================================================================
 2. FUNCIONALIDADES PRINCIPAIS
 ====================================================================
-- Mapeamento Inteligente: Detecção de discos, partições, tipo de mídia (NVMe, SSD, HDD) e limites de uso.
-- Varredura de Alto Desempenho: Identificação dos "Top 50 Maiores Arquivos" e "Top 20 Pastas" usando QThreads sem travar a interface.
-- Algoritmo Anti-Duplicatas (3 Etapas): Compara por tamanho exato, hash de amostras das pontas (2MB) e finalmente hash SHA-256 completo.
-- Motor de Regras Inteligentes: Identifica padrões (ex: arquivo de mídia de 50GB em um NVMe veloz que deveria estar em um disco SATA lento de backup).
-- Histórico Persistente: Operações como Mover/Deletar são registradas em um banco de dados SQLite local, garantindo um "Undo" seguro.
-- Servidor MCP Completo: Expõe 13 tools (7 leitura + request_confirmation + 5 executivas) e 3 resources JSON para clientes LLM externos via Model Context Protocol. Ações executivas auditadas com ai_source='ai:mcp'.
-- Assistente IA Local (Ollama): Aba de chat integrada à GUI que conecta diretamente a modelos LLM locais (llama3, qwen2.5, etc.) rodando via Ollama, com contexto dinâmico do estado dos discos injetado automaticamente.
+- Mapeamento de discos: partições, tipo de mídia (NVMe/SSD/HDD/Desconhecido), uso.
+- Varredura de alto desempenho em QThreads sem travar a UI; abas e índice são populados
+  logo após a listagem (Etapa 2), antes da detecção de duplicatas (não-bloqueante).
+- Top 50 maiores arquivos e Top 20 pastas mais pesadas (soma recursiva completa).
+- Categorização por extensão: Imagens, Vídeos, Áudio, Documentos, Executáveis,
+  Compactados, Modelos IA (.gguf/.safetensors/.bin), Outros.
+- Detecção de duplicatas em 3 etapas: tamanho exato → hash parcial (1 MB head+tail) →
+  SHA-256 completo. Com cache de hash (re-scan rápido quando nada mudou).
+- Motor de Regras (R1 mídia pesada em NVMe; R2 duplicatas; R3 disco >90%), com validação
+  de destino (espaço suficiente, origem ≠ destino, disco existente).
+- Histórico persistente (SQLite) com Undo seguro.
+- Servidor MCP (13 tools + 3 resources JSON), ações auditadas com ai_source='ai:mcp'.
+- Assistente IA Local (Ollama) com tool-calling e contexto dinâmico do estado dos discos;
+  backend trocável via Protocol AIBackend.
 
 ====================================================================
-2.1 LIMITAÇÕES CONHECIDAS (v0.3-dev)
+3. ARQUITETURA E MÓDULOS (com tamanho atual)
 ====================================================================
-- Cobertura de testes: 387 testes (Sprints 0-6 + Push de Cobertura). GUI principal e workers não possuem testes automatizados (cobertura total do core: 83%). path_guard 100%, telemetry 100%, skills_loader 100%, ollama_client 95%, mcp_server 97%, scanner 88%, storage_db 97%.
-
-====================================================================
-3. ARQUITETURA DO PROJETO E MÓDULOS
-====================================================================
-O projeto segue a arquitetura Model-View-Controller assíncrona, distribuída nos seguintes módulos:
-
 gestaopc/
-├── src/core/
-│   ├── scanner.py        # Módulo de mapeamento de discos e leitura de arquivos
-│   ├── analyzer.py       # Algoritmo de duplicatas e Motor de Regras
-│   ├── executor.py       # Manipulação segura de arquivos via send2trash/shutil
-│   ├── storage_db.py     # Camada de banco de dados SQLite (DB)
-│   └── ollama_client.py  # Cliente HTTP para comunicação com servidor Ollama local
-├── src/gui/
-│   ├── main_window.py    # GUI Principal em PyQt6 — thin orchestrator (422 linhas)
-│   ├── workers.py        # QThreads que se conectam ao core para não congelar o UI
-│   ├── assistant_tab.py  # Aba do Assistente IA Local (chat Ollama com contexto de disco)
-│   ├── charts.py         # Dashboards e Gráficos do zero em QPainter
-│   ├── icon.py           # Ícone programático e system tray
-│   ├── styles.py         # Tema e CSS dark mode responsivo
-│   └── tabs/             # Sub-widgets de aba (Sprint 5)
-│       ├── shared.py         # DiskUsageBar, SuggestionCard, make_label, make_separator
-│       ├── overview_tab.py   # OverviewTab — uso de discos + donut chart
-│       ├── top_files_tab.py  # TopFilesTab — tabela + filtros + gráfico de categorias
-│       ├── top_dirs_tab.py   # TopDirsTab — pastas mais pesadas
-│       ├── duplicates_tab.py # DuplicatesTab — grupos SHA-256 + seleção + deleção
-│       ├── suggestions_tab.py# SuggestionsTab — cards do Motor de Regras
-│       └── history_tab.py    # HistoryTab — histórico SQLite + undo/clear
+├── src/
+│   ├── main.py                28L   Ponto de entrada (QApplication + MainWindow)
+│   ├── core/
+│   │   ├── ai_toolbelt.py     986L  13 tools (leitura+executivas) + tokens + rate-limit
+│   │   │                            + path guard + seam de aprovação humana (S5)
+│   │   ├── tool_schemas.py    281L  Schemas JSON das tools (extraído de ai_toolbelt — RECON 8.3.1)
+│   │   ├── ai_backend.py       46L  Protocol AIBackend (desacopla GUI do Ollama — RECON 8.4)
+│   │   ├── analyzer.py        614L  Duplicatas 3-etapas + SmartRulesEngine
+│   │   ├── scanner.py         413L  Inventário de discos + varredura de arquivos
+│   │   ├── executor.py        325L  Mover/deletar/undo seguro (send2trash)
+│   │   ├── storage_db.py      700L  Camada SQLite (settings, file_index, history, suggestions)
+│   │   ├── path_guard.py      136L  Validação de caminhos (normaliza \\?\, compara por componentes)
+│   │   ├── hash_cache.py      117L  Protocol HashCache + InMemoryHashCache
+│   │   ├── skills_loader.py   120L  Loader de perfis RAG (.md)
+│   │   ├── ollama_client.py   181L  Cliente HTTP do Ollama (satisfaz AIBackend)
+│   │   ├── telemetry.py       180L  Telemetria local JSONL opt-in (sem PII, sem rede)
+│   │   └── config.py           73L  Single-source-of-truth de constantes
+│   ├── gui/
+│   │   ├── main_window.py     437L  Janela principal (6 abas); resultado parcial + final
+│   │   ├── assistant_tab.py   672L  Chat Ollama + tool-calling + diálogo de aprovação humana (S5)
+│   │   ├── workers.py         400L  FullScanWorker (partial_result + finished_result)
+│   │   ├── scan_status_panel.py 276L Painel de progresso por disco
+│   │   ├── charts.py          261L  Donut + barras (QPainter)
+│   │   ├── styles.py          363L  Design system (QSS dark)
+│   │   ├── log_bridge.py       90L  logger Python → Qt Signal (status bar thread-safe)
+│   │   ├── icon.py            138L  Ícone programático + system tray
+│   │   └── tabs/                    overview, top_files, top_dirs, duplicates,
+│   │                                suggestions, history, shared
 ├── scripts/
-│   └── mcp_server.py     # Conector Model Context Protocol (2 tools, 2 resources — v0.2)
+│   ├── mcp_server.py                Servidor MCP (stdio) — 13 tools, 3 resources
+│   └── build_release.py             Wrapper de build PyInstaller --onedir
+├── gestaopc.spec                    Spec do PyInstaller (--onedir, DLLs Qt soltas/LGPL)
+├── packaging/README_DISTRIBUICAO.md README da pasta de release (substituição de DLL LGPL)
 ├── docs/
-│   └── COVERAGE_BASELINE.md  # Baseline de cobertura de testes (gerado em 2026-05-07)
-├── specs/
-│   ├── 01-storage-manager.md # Especificação do módulo principal
-│   └── 02-ai-toolbelt.md     # Especificação da camada de IA (contrato para Sprints 1-3)
-├── tests/                # Suíte de testes com PyTest (136 testes — cobertura: core only)
-├── pyproject.toml        # Metadados do pacote Python
-└── requirements.txt      # Dependências de bibliotecas e versões
+│   ├── RECON_REPORT.md              Diagnóstico read-only + status dos itens
+│   ├── AUDITORIA_EFICIENCIA_SEGURANCA.md  Auditoria (eficiência 7.0 / segurança 6.5 / privacidade 8.5)
+│   ├── TESTES_PRATICOS.md           Checklist de aceitação manual
+│   ├── PACKAGING.md                 Guia de build
+│   └── COVERAGE_BASELINE.md         Baseline de cobertura
+├── specs/                           Especificações (spec-driven)
+├── skills/                          Perfis RAG do assistente (.md)
+├── tests/                           17 arquivos, 610 testes (pytest)
+├── pyproject.toml                   Metadados, deps, ruff/mypy/pytest, gui-scripts, packaging
+└── requirements.txt
 
 ====================================================================
 4. TECNOLOGIAS E DEPENDÊNCIAS
 ====================================================================
-- Linguagem Base: Python 3.11+
-- Banco de Dados: SQLite3 integrado nativamente.
-- Framework GUI: PySide6 (QWidgets, QThread, QPainter) — LGPL v3, compatível com licença MIT do projeto.
-- File System IO: psutil (monitoramento físico do HD/SSD) e bibliotecas Nativas.
-- Antivírus / Sistema: Tratamento rigoroso de permissões e envios via `send2trash`.
-- Protocolo IA (Externo): `mcp` (Model Context Protocol) provido pela Anthropic via SDK.
-- IA Local: `ollama` via HTTP REST (porta 11434) — compatível com llama3, qwen2.5 e outros.
-- Qualidade: pytest + pytest-cov (Testes), ruff (Linting), mypy (Type checking).
+- Python 3.11+; SQLite3 (WAL + foreign_keys).
+- GUI: PySide6 >=6.6,<7.0 (LGPL v3 — DLLs distribuídas soltas/substituíveis).
+- psutil (inventário), send2trash (Lixeira), mcp (Servidor MCP), httpx/anyio/pydantic
+  (transitivas do mcp, declaradas explicitamente), todas com pin de teto.
+- IA Local: Ollama via HTTP (localhost:11434) — não sai da máquina.
+- Dev: pytest, pytest-cov, ruff, mypy. Packaging: pyinstaller (extra opcional).
 
 ====================================================================
-5. DETALHAMENTO DE PERSISTÊNCIA (SQLite)
+5. QUALIDADE E CI
 ====================================================================
-Através do módulo `StorageManagerDB` e o seu banco em `%LOCALAPPDATA%/GestaoPC/storage_manager.db`, o app armazena as seguintes entidades:
-- app_settings: Configurações dinâmicas persistidas.
-- disk_roles: Rótulo lógico dos discos físicos.
-- scan_sessions: Resumo contendo duração de cada varredura de discos.
-- operation_history: Histórico de deleção/remoção persistido (Data, Caminho, Sucesso/Erro, Backup Lixeira).
-- file_index: Um índice/cache com arquivos de interesse com a sua respectiva categoria, hashes e timestamps.
-- suggestions: Recomendação do motor guardadas em cache temporário após cada varredura.
+- Testes segmentados via hook em conftest (mapa arquivo→marker): 245 unit, 365 integration.
+- CI (.github/workflows/ci.yml, windows-latest, QT_QPA_PLATFORM=offscreen):
+  ruff check . → mypy src/ → pytest -m unit → pytest -m integration.
+- mypy gradual: allowlist strict para config, path_guard, hash_cache, telemetry,
+  skills_loader, ai_backend.
 
 ====================================================================
-6. SEGURANÇA E PROTEÇÃO
+6. SEGURANÇA (estado atual)
 ====================================================================
-- Resiliência contra Antivírus: Pastas bloqueadas temporariamente por Kaspersky e outros não "quebram" o sistema de varredura.
-- Exclusão do Core do SO: Diretórios vitais do Windows (`C:\Windows`, `C:\Program Files`, `ProgramData`) são hardcoded para serem ignorados.
-- Undo Reversível: Arquivos enviados para a Lixeira do Windows podem ser resgatados facilmente; Movimentações registradas no SQLite podem ser desfeitas via interface do app.
+Fechados em sprints anteriores (auditoria geral):
+- S-1: path guard universal aplicado a GUI e a todas as tools executivas.
+- S-2: binding criptográfico de argumentos no token (SHA-256) — anti reuse com paths diferentes.
+- S-4: validação do destino montado em apply_suggestion.
 
-====================================================================
-7. INSTRUÇÕES E COMANDOS DE USO
-====================================================================
-O software contém ferramentas em linha de comando interativas para testes, uso pessoal e interface gráfica. Para a melhor experiência, ative seu ambiente virtual `venv`.
+Sprint de Hardening — concluído 2026-06-30 (auditoria de 2026-06-29):
+- S5 (ALTA): aprovação humana FORA da banda da IA. ai_toolbelt expõe set_approval_hook;
+  as 5 funções executivas consultam o hook após o token e antes de tocar o FS. A GUI
+  instala um hook que mostra diálogo modal (ação + risco) e bloqueia o worker até a
+  decisão (timeout → nega). Default sem hook = token-only (back-compat/MCP/testes).
+- S6 (ALTA): whitelist de tools em _execute_tool — o LLM não pode mais chamar helpers
+  internos (ex.: _reset_rate_limiter) via getattr arbitrário.
+- S7 (ALTA): path guard normaliza prefixo estendido \\?\ (e \\?\UNC\) e compara por
+  COMPONENTES de caminho — fecha o bypass \\?\C:\Windows e os falsos positivos de fronteira.
+- S8 (MÉDIA): RLock no token store e rate limiter; _validate_token atômico (one-shot
+  garantido) e _reserve_exec_slot atômico (rate-limit à prova de concorrência).
+- S9 (MÉDIA): ai_source forçado — o LLM não forja mais a trilha de auditoria.
+- S10 (MÉDIA): sem send2trash a deleção é RECUSADA (TRASH_UNAVAILABLE), nunca permanente
+  silenciosa contradizendo a descrição "reversível".
 
-A) Instalação das Dependências:
-> pip install -e .
-Ou se preferir métodos isolados:
-> pip install -r requirements.txt
+Pontos fortes confirmados: SQL 100% parametrizado; superfície de rede mínima (MCP via
+stdio, Ollama em loopback, nada em 0.0.0.0); telemetria opt-in local sem PII; supply-chain
+com pins de teto e LGPL documentada.
 
-B) Inicializar o Aplicativo Gráfico (Interface):
-> python run_gui.py
-Para pular o clique do botão manual e começar a mapear o PC imediatamente:
-> python run_gui.py --auto-scan
-
-C) Inicializar o Servidor MCP (Para Clientes LLM como Claude Desktop):
-> python -m scripts.mcp_server
-Nota: Adicione ao arquivo de configuração de seu cliente MCP as opções `command: python`,
-`args: ["-m", "scripts.mcp_server"]` tendo o cwd focado nesta pasta raiz.
-
-D) Usar o Assistente IA Local (Ollama):
-Pré-requisito: instale o Ollama (https://ollama.com) e baixe um modelo:
-> ollama run llama3
-Após iniciar o app normalmente (item B), acesse a aba "Assistente IA" na GUI.
-
-E) Execução da Suíte de Testes (TDD):
-Para testar a segurança contra regressão:
-> python -m pytest tests/ -v
-Para relatório de cobertura:
-> python -m pytest tests/ --cov=src --cov=scripts --cov-report=term-missing -q
+Itens de segurança ABERTOS (baixa urgência): modelo denylist deixa C:\Users e discos
+D:/E: fora do guard (considerar allowlist); TOCTOU resíduo entre validação e I/O;
+undo_last_operation sem sufixo anti-sobrescrita. Ver docs/AUDITORIA_EFICIENCIA_SEGURANCA.md.
 
 ====================================================================
-8. ROADMAP — EVOLUÇÃO DO AGENTE AUTÔNOMO
+7. EFICIÊNCIA (estado e itens abertos)
 ====================================================================
-Sprint 1 — Camada ai_toolbelt: ✅ CONCLUÍDO. Módulo centralizado com 13 tools compartilhadas entre MCP e Ollama (67 testes, 72% cobertura).
-Sprint 2 — MCP Completo: ✅ CONCLUÍDO. Servidor reescrito com 13 tools executivas, 3 resources JSON, token de confirmação one-shot (31 testes, 97% cobertura).
-Sprint 3 — Ollama com Tool-Calling: ✅ CONCLUÍDO. Loop agente com chat_with_tools(), contexto enriquecido (partições + sugestões + duplicatas + histórico), 25 testes (95% cov ollama_client).
-Sprint 4 — Skills RAG: ✅ CONCLUÍDO. skills_loader.py (100% cov) + 4 perfis .md (limpeza mídia, downloads, SSD, duplicatas) + seletor ComboBox na GUI injetado no system prompt.
-Sprint 5 — Refatoração GUI: ✅ CONCLUÍDO. main_window.py 1807→422 linhas. Pacote src/gui/tabs/ com 7 sub-widgets (OverviewTab, TopFilesTab, TopDirsTab, DuplicatesTab, SuggestionsTab, HistoryTab + shared.py). Sinal ai_action_executed em AssistantTab conectado ao HistoryTab.refresh(). 288 testes passando.
-Sprint 6 — Hardening: ✅ CONCLUÍDO. path_guard.py (validação de caminhos absolutos + diretórios protegidos), MAX_BATCH_SIZE=50 no executor, TelemetryLogger opt-in (JSONL local sem PII), bump v0.3.0. 352 testes (64 novos).
-Push de Cobertura: ✅ CONCLUÍDO. 35 novos testes cobrindo top_largest_dirs(), _dir_size_recursive(), branches do DuplicateDetector (etapa 2 early return, OSError em getsize, tail hash, _hash_full OSError), branches de exceção silenciosa em telemetry.py e path_guard.py. Core coverage: 83%. path_guard e telemetry em 100%. 387 testes totais.
-Sprint 7.0 — Quick Wins de UX de Varredura: ✅ CONCLUÍDO. Mitigação da percepção de "travamento" durante operações longas (Etapa 3 do DuplicateDetector — hash SHA-256 completo, 5–15 min). (1) Novo módulo src/gui/log_bridge.py (QtLogBridge) — captura logger.info/warning de todos os módulos core e re-emite via pyqtSignal para a status bar, eliminando o silêncio de 13+ minutos durante hash completo. (2) Novo sinal FullScanWorker.progress_indeterminate(bool) — aciona modo "busy" do QProgressBar (range 0,0 → animação contínua) durante find_duplicates, evitando barra parada em 65%. (3) Mensagem clara "Comparando duplicatas (hash SHA-256, pode demorar varios minutos)..." na entrada da Etapa 3. 18 novos testes (14 log_bridge + 4 workers signals). 405 testes totais.
-Sprint 7.1 — Painel de Status de Varredura por Disco: ✅ CONCLUÍDO. Visibilidade granular de progresso. (1) Novo widget src/gui/scan_status_panel.py (ScanStatusPanel + _DiskRow) — painel inline entre header e tabs, oculto por padrão, mostra cada disco com ícone Unicode (○ pendente / ⟳ em curso / ✓ concluído / ✗ falhou), letra, badge de tipo de mídia (NVMe/SSD/HDD) e label de estágio atual. Cabeçalho com cronômetro mm:ss atualizado a cada segundo via QTimer. Estágio global exibido em itálico no rodapé (ex.: "Comparando duplicatas...", "Avaliando regras..."). Auto-oculta 4s após fim da varredura. (2) Três novos sinais em FullScanWorker: partitions_detected(list), disk_state_changed(letter, status, stage), global_stage_changed(text). (3) Refatoração do worker: as duas passagens por disco (top_files + top_dirs) foram fundidas em um único loop por disco, permitindo que cada disco transite pending → scanning → done sequencialmente em vez de todos os discos ficarem pendentes durante a primeira passagem. Estado "error" emitido quando exceção ocorre em qualquer subdir. 37 novos testes (31 painel + 6 sinais). 442 testes totais.
-Bug fix (workers.py:271) — FileEntry.modified_time: Campo ausente na dataclass causava AttributeError após Etapa 3 do DuplicateDetector, descartando ~13 min de varredura. Adicionado modified_time:float=0.0 e migrado top_largest_files para os.stat (uma syscall em vez de duas). 4 novos testes (regressão DB persistence + propriedades). 446 testes totais.
-Sprint 7.2 — Hardening de Segurança Crítica (S-1, S-2, S-4): ✅ CONCLUÍDO. Fechadas as três vulnerabilidades críticas identificadas na auditoria geral. (1) S-1 path guard universal — _is_protected agora delega a path_guard.validate_path (resolve symlinks, exige caminho absoluto, bloqueia Windows/Program Files/Recovery/Boot/SVI/$Recycle.Bin); novo helper _assert_safe(path, role) com mensagem padronizada PROTECTED_PATH; aplicado em move_to_trash, move_file (origem E destino), apply_suggestion (file_path E target_path montado), undo_last_operation (current_path E restore_path lidos do DB). Constantes locais PROTECTED_PATH_PREFIXES/PROTECTED_FILENAMES re-exportadas de path_guard para evitar divergência. (2) S-2 binding criptográfico de argumentos no token — _ConfirmationToken ganhou args_fingerprint (SHA-256 estável de args canonicalizados via JSON sort_keys); novo helper _fingerprint_args(args) exclui confirmation_token e ai_source do hash; _validate_token estendido com call_args opcional (compat com testes legados); todas as 5 tools executivas passam {args} para _validate_token. Token NÃO é consumido em TOKEN_ARGS_MISMATCH para permitir retry. (3) S-4 validação de target em apply_suggestion — target_path montado a partir de target_disk do DB agora passa por _assert_safe antes do shutil.move. 16 novos testes em test_ai_toolbelt.py (TestS1PathGuardInExecutiveTools 6, TestS2TokenArgsBinding 7, TestS4ApplySuggestionTargetValidation 2, TestUndoOperationPathValidation 1). 462 testes totais. Sprint encerra os bloqueantes críticos para release público.
-Sprint 7.3.1 — Migração PyQt6 → PySide6 + Compliance LGPL: ✅ CONCLUÍDO. Eliminação do conflito de licenças (SC-3 da auditoria) que impedia distribuição pública sob MIT. (1) Substituições mecânicas em 20 arquivos: 42 imports `PyQt6` → `PySide6`, 33 ocorrências de `pyqtSignal` → `Signal`. Zero usos de pyqtSlot/pyqtProperty/QtMultimedia/QtNetwork/etc. (2) test_workers_signals.py refatorado: `pyqtBoundSignal` (não existe em PySide6) substituído por helper duck-typing `_is_signal_like(obj)` que checa `hasattr(emit) and hasattr(connect)` — portável a qualquer binding Qt futuro. (3) tests/conftest.py ganhou fixture session-scoped autouse `_qt_application` que cria QApplication única para todo o run, resolvendo conflito PySide6 onde QCoreApplication criada antes impedia upgrade para QApplication em testes posteriores. (4) pyproject.toml e requirements.txt atualizados: PySide6>=6.6,<7.0; pins com teto adicionados em todas as deps (psutil, send2trash, mcp, ruff, pytest); deps transitivas críticas do mcp declaradas explicitamente (anyio>=4.0,<5.0, httpx>=0.25,<1.0, pydantic>=2.0,<3.0); pytest-cov movido para dev-deps formal. (5) LICENSES/THIRD_PARTY_NOTICES.md criado com aviso LGPL completo, mecanismos de substituição da lib (pip / PyInstaller), justificativa da migração e tabela de licenças de todas as deps. Resultado: licença MIT do GestaoPC preservada, distribuição pública desbloqueada. 462 testes passando em PySide6 6.11.0 / Qt 6.11.0. Esforço efetivo: ~2 horas (vs estimativa original de 12-16 dias para todo o Sprint 7.3 — a migração PyQt→PySide foi a parte mais barata por ter zero recursos exotéricos em uso).
-Sprint 7.4 — Cache de Hash + Re-Scan Rápido: ✅ CONCLUÍDO. Reaproveitamento de hashes computados em scans anteriores transforma re-scans de ~13 min para ~segundos quando o conjunto de arquivos pouco mudou. (1) Novo módulo src/core/hash_cache.py com Protocol HashCache + 2 implementações: NullHashCache (no-op default) e InMemoryHashCache (dicts in-memory + tracking de seed vs writes via partial_writes/full_writes/partial_hits/full_hits). (2) DuplicateDetector.find_duplicates(files, *, cache=None) — cache opcional consultado em Etapa 2 (hash parcial) e Etapa 3 (hash completo) antes de recomputar. NullHashCache lazy-imported no default para não acoplar analyzer ao hash_cache. Sintaxe keyword-only preserva backward-compat com chamadas existentes. (3) StorageManagerDB ganhou get_file_index_batch(paths) — UMA query SELECT WHERE path IN (?,...) com chunking de 500 (limite SQLITE_MAX_VARIABLE_NUMBER) e update_file_hashes_batch(updates) para persistência atômica multi-row. (4) FullScanWorker._build_hash_cache: hidrata InMemoryHashCache do DB validando size_bytes idêntico E mtime dentro de tolerância de 1.0s (NTFS resolve em 100ns mas Python introduce jitter); entradas obsoletas silenciosamente descartadas e logadas. (5) FullScanWorker.run() chama _build_hash_cache antes de find_duplicates, passa o cache, loga métricas (partial_hits, full_hits, partial_writes, full_writes) ao final, e propaga hash_cache.get_partial/get_full ao upsert_file_index final, garantindo que hashes sejam persistidos para o próximo scan. 38 novos testes (test_hash_cache.py 21 + TestDuplicateDetectorWithCache 6 + TestGetFileIndexBatch 5 + TestUpdateFileHashesBatch 6). 500 testes totais. Ganho esperado em produção: re-scan de 30 min → 3-5 min em arquivos não modificados (ganho de UX percebido equivalente ao Sprint 7.0/7.1 combinados).
-Sprint 7.5 — Resource Lifecycle no AssistantTab: ✅ CONCLUÍDO. Fechadas as vulnerabilidades S-6 (vazamento de DB/Ollama/threads) e Q-3 (worker substituído sem cleanup) e Q-5 (exceções silenciosas em _get_system_context) da auditoria geral. (1) Novo closeEvent(QCloseEvent) em AssistantTab — para worker ativo via quit+wait com timeout de 3000ms (terminate como fallback se não responder), fecha conexão SQLite (set _db=None), tudo robusto a exceções. (2) Helper _stop_active_worker(timeout_ms): captura referência local, zera self._worker (evita reentrância), disconecta sinais, quit+wait, terminate em fallback, deleteLater. (3) Helper _disconnect_worker_signals(worker) idempotente: itera _WORKER_SIGNAL_NAMES (tool_call_started/finished, text_received, error_occurred, finished_response, token_received) e chama disconnect() ignorando RuntimeError de "not connected". (4) _send_message agora chama _stop_active_worker(2000) antes de criar novo worker — evita acúmulo de threads se usuário spam-clicar antes da resposta. (5) _on_response_finished agora chama _stop_active_worker(_WORKER_CLEANUP_TIMEOUT_MS=500) após cada turno, liberando QObject via deleteLater. (6) _get_system_context: 4 except Exception migrados de silenciosos para logger.exception(...) — preserva stack trace para diagnóstico de bugs como o "modified_time" recém-corrigido em vez de mascarar. 27 novos testes (TestCloseEvent 6, TestStopActiveWorker 8, TestDisconnectWorkerSignals 4, TestOnResponseFinished 4, TestSystemContextLogging 5) — todos baseados em mocks de QThread + OllamaClient para evitar dependência de servidor real. 527 testes totais. Sessão longa do Assistente IA não acumula mais threads em background nem vaza FDs do SQLite.
-Sprint 7.6 — Centralização de Configuração + mypy + Dead Code Removal: ✅ CONCLUÍDO. Endereça E-1 (magic numbers espalhados), Q-15 (sem mypy) e bug residual (OllamaChatWorker dead code). (1) Novo módulo src/core/config.py com 17 constantes tipadas agrupadas por domínio: SCAN_* (4), HASH_* (3), EXECUTOR_* (1), AI_* (2), OLLAMA_* (1), LOG_* (1), WORKER_* (4); zero deps de PySide6 — pure stdlib, importável de qualquer contexto. (2) Migrações: scanner.py/analyzer.py (HASH_SAMPLE_SIZE, HASH_FULL_CHUNK_SIZE), executor.py (EXECUTOR_MAX_BATCH_SIZE), ai_toolbelt.py (AI_MAX_EXEC_PER_MINUTE, AI_TOKEN_TTL_SECONDS), ollama_client.py (OLLAMA_DEFAULT_HOST), log_bridge.py (LOG_BRIDGE_MAX_MESSAGE_LENGTH), workers.py (5 constantes SCAN_*/HASH_*), assistant_tab.py (3 timeouts WORKER_*). Aliases backward-compat preservados para testes que fazem patch de nomes locais (ex.: _SAMPLE_SIZE em test_analyzer). (3) Setup de mypy com estratégia gradual: [tool.mypy] no pyproject.toml com modo padrão razoavelmente forte (strict_optional, no_implicit_optional, check_untyped_defs) + allowlist strict via [[tool.mypy.overrides]] para 5 módulos novos/limpos (config, path_guard, hash_cache, telemetry, skills_loader). Fix de 2 erros em telemetry.py (tipo `db: object | None` para evitar import circular + bool() coercion em is_enabled). mypy>=1.0,<2.0 adicionado a dev-deps. Comando: `python -m mypy src/core/config.py src/core/path_guard.py src/core/hash_cache.py src/core/telemetry.py src/core/skills_loader.py` → Success: no issues. (4) Dead code removido de assistant_tab.py: classe OllamaChatWorker (24 linhas) e método _on_token (8 linhas) — nunca instanciados/chamados; lifecycle restante (Sprint 7.5) preservado. token_received removido de _WORKER_SIGNAL_NAMES, import QTextCursor removido. 22 novos testes em test_config.py (TestScannerConstants 4, TestHashConstants 3, TestExecutorConstants 1, TestAIConstants 2, TestOllamaConstants 1, TestLogBridgeConstants 1, TestWorkerTimeouts 5, TestBackwardCompatAliases 4, TestPureCore 1). 549 testes totais. Single-source-of-truth para magic numbers + base sólida para tightening incremental do mypy nos próximos sprints.
+Pontos fortes: pipeline de duplicatas 3-etapas; hash parcial head+tail; cache de hash com
+validação size+mtime; varredura não-bloqueante (abas em segundos); conexão SQLite por thread.
+
+Itens ABERTOS para um futuro "Sprint de Escala" (ver auditoria):
+- E1 (ALTA): travessia dupla da árvore por disco (arquivos stat'd 2×) — unificar.
+- E2 (ALTA): top_largest_files materializa todos os arquivos antes do top-N — usar heap.
+- E3 (ALTA): SHA-256 em blocos de 8 KB — subir para 1 MB (principal causa dos ~73 min/3TB).
+- E4 (ALTA): file_index só guarda top-50 — limita a IA; persistir índice completo + índices SQLite.
+- E5–E8 (MÉDIA/BAIXA): escopo de duplicatas, contexto da IA no thread da UI, índices SQLite,
+  batches de upsert.
+
+====================================================================
+8. EMPACOTAMENTO E DISTRIBUIÇÃO
+====================================================================
+- Entry point: [project.gui-scripts] gestaopc = src.main:main (instalável via pip install -e .).
+- Build: `pip install -e ".[packaging]"` + `python scripts/build_release.py` → dist/GestaoPC/.
+- PyInstaller --onedir (NÃO --onefile): DLLs do Qt ficam soltas em _internal/PySide6/,
+  substituíveis pelo usuário — exigência LGPL do THIRD_PARTY_NOTICES.
+- A pasta inteira deve ser distribuída (não só o .exe). Dados do app vivem em
+  %LOCALAPPDATA%\GestaoPC\ (fora do bundle).
+
+====================================================================
+9. COMANDOS DE USO
+====================================================================
+A) GUI:           python run_gui.py [--auto-scan]   (ou: gestaopc após pip install -e .)
+B) Servidor MCP:  python -m scripts.mcp_server
+C) Assistente IA: instale Ollama + um modelo (ollama run llama3); aba "Assistente IA".
+D) Testes:        python -m pytest tests/ -q
+   Rápidos:       python -m pytest tests/ -m unit -q
+   Cobertura:     python -m pytest tests/ --cov=src --cov=scripts --cov-report=term-missing -q
+E) Qualidade:     python -m ruff check .   ·   python -m mypy src/
+
+====================================================================
+10. HISTÓRICO RECENTE (consolidado em master, merge cf539d4)
+====================================================================
+Correções RECON (itens restantes):
+- Segmentação de testes + aviso de detecção de mídia (RECON 8.3.4/8.3.5).
+- Empacotamento PyInstaller --onedir LGPL-compliant (RECON 7.2).
+- Protocol AIBackend desacoplando a GUI do Ollama (RECON 8.4).
+- Extração de get_tool_schemas para tool_schemas.py (RECON 8.3.1).
+- (8.3.2 split de storage_db: deferido — classe coesa, ganho estético.)
+
+Correção de bug de varredura:
+- Abas e file_index populados após a listagem (Etapa 2), antes da detecção de duplicatas;
+  o índice reflete a varredura atual mesmo se a fase de duplicatas for interrompida.
+
+Auditoria + Sprint de Hardening:
+- Auditoria de eficiência/segurança (docs/AUDITORIA_EFICIENCIA_SEGURANCA.md).
+- S5–S10 implementados e testados (610 testes verdes).
+
+Verificação pendente (manual): fluxo do diálogo modal de aprovação (S5) na GUI real —
+ver docs/TESTES_PRATICOS.md.
