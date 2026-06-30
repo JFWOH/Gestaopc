@@ -104,9 +104,19 @@
 
 > Resultado: as 3 brechas ALTA e as 4 MÉDIA da superfície da IA foram fechadas. 610 testes verdes (incluindo concorrência e fail-closed). O fluxo do diálogo modal cross-thread (S5) requer verificação manual na GUI — ver `docs/TESTES_PRATICOS.md`.
 
-**Sprint de Escala (quando for indexar discos grandes):**
-6. **E2** (heap em `top_largest_files`) + **E1** (travessia única) + **E3** (chunk 1 MB) — os três maiores ganhos de tempo/memória.
-7. **E4 + E7** — persistir índice completo **junto** com os índices SQLite (um depende do outro).
+**✅ Sprint de Escala — em grande parte CONCLUÍDO (2026-06-30, branch `sprint-escala`):**
+6. ✅ **E3** — chunk de hash 8 KB → 1 MB (commit `38c01aa`). *Maior alavanca de tempo da Etapa 3.*
+7. ✅ **E7** — índices SQLite secundários (commit `38c01aa`).
+8. ✅ **E2** — min-heap em `top_largest_files`: memória O(N) (commit `9c03543`).
+9. ✅ **E4** — persistir índice completo (não só top-50) + upsert em lote (commit `4071757`).
+10. ⚪ **E1** (travessia única por disco) — **DEFERIDO**. `top_largest_files` (os.walk) e
+    `top_largest_dirs` (os.scandir recursivo) têm semânticas sutis distintas (tratamento de
+    `$`-prefix, pontos de poda de `SYSTEM_EXCLUDED_DIRS`); unificar no core do scan tem alto
+    risco de regressão para ganho marginal — a fase de listagem deixou de ser o gargalo
+    dominante depois que E3 resolveu o hashing. Reavaliar se a listagem virar o gargalo medido.
+
+**Ainda abertos (MÉDIA/BAIXA):** E5 (escopo de duplicatas sobre todos os arquivos),
+E6 (contexto da IA fora do thread da UI), E8 (batch de upsert — parcialmente endereçado por E4).
 
 **Polimento:**
 8. E6 (contexto da IA fora do thread da UI), E5, E8, P1-P4.

@@ -154,6 +154,16 @@ _DDL_STATEMENTS: list[str] = [
         created_at      REAL    NOT NULL
     )
     """,
+    # E7 (Sprint de Escala): índices secundários. Sem eles, as consultas da IA
+    # e da GUI faziam full scan + sort no file_index — irrelevante com ~50 linhas,
+    # mas crítico quando o índice cresce (E4). CREATE INDEX IF NOT EXISTS é
+    # idempotente (migração transparente para bancos existentes).
+    "CREATE INDEX IF NOT EXISTS idx_file_index_size ON file_index(size_bytes DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_file_index_full_hash ON file_index(full_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_file_index_disk ON file_index(disk_letter)",
+    "CREATE INDEX IF NOT EXISTS idx_file_index_category ON file_index(category)",
+    "CREATE INDEX IF NOT EXISTS idx_operation_history_ts ON operation_history(timestamp DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_suggestions_filter ON suggestions(dismissed, created_at DESC)",
 ]
 
 
@@ -523,6 +533,42 @@ class StorageManagerDB:
                     category, partial_hash, full_hash, last_seen,
                 ),
             )
+
+    def upsert_file_index_many(
+        self, rows: list[tuple[str, str | None, int, float, str | None,
+                               str | None, str | None, float]]
+    ) -> int:
+        """
+        E4 (Sprint de Escala): upsert em LOTE no file_index, numa única
+        transação (executemany), em vez de um commit/fsync por arquivo.
+
+        Cada tupla: (path, disk_letter, size_bytes, mtime, category,
+        partial_hash, full_hash, last_seen). Retorna o nº de linhas processadas.
+
+        Necessário porque E4 passa a persistir TODO o conjunto varrido (não só
+        o top-50), o que tornaria o upsert linha-a-linha custoso.
+        """
+        if not rows:
+            return 0
+        with self._db:
+            self._db.executemany(
+                """
+                INSERT INTO file_index (
+                    path, disk_letter, size_bytes, mtime,
+                    category, partial_hash, full_hash, last_seen
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                    disk_letter  = excluded.disk_letter,
+                    size_bytes   = excluded.size_bytes,
+                    mtime        = excluded.mtime,
+                    category     = excluded.category,
+                    partial_hash = excluded.partial_hash,
+                    full_hash    = excluded.full_hash,
+                    last_seen    = excluded.last_seen
+                """,
+                rows,
+            )
+        return len(rows)
 
     def get_file_index(self, path: str) -> sqlite3.Row | None:
         """Retorna a entrada do índice para um caminho, ou None."""

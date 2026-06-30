@@ -47,7 +47,11 @@ SCAN_DIR_MAX_DEPTH: int = 2
 HASH_SAMPLE_SIZE: int = 1024 * 1024  # 1 MB
 
 # Tamanho do chunk lido em loop para hash completo (Etapa 3).
-HASH_FULL_CHUNK_SIZE: int = 8192
+# E3 (Sprint de Escala): 1 MB em vez de 8 KB — reduz ~128× as iterações Python
+# e syscalls de read() ao hashear arquivos grandes (ex.: ISO de 3 GB: ~3 mil
+# leituras em vez de ~393 mil), principal alavanca de tempo da detecção de
+# duplicatas. Custo de RAM (1 MB por hash em andamento) é irrelevante.
+HASH_FULL_CHUNK_SIZE: int = 1024 * 1024  # 1 MB
 
 # Tolerância em segundos ao comparar mtime do filesystem com o cacheado no DB.
 # NTFS resolve em 100ns mas Python/pytest introduzem jitter de até 1s.

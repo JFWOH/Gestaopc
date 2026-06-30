@@ -45,7 +45,7 @@ class TestHashConstants:
     def test_hash_full_chunk_size(self):
         assert isinstance(config.HASH_FULL_CHUNK_SIZE, int)
         assert config.HASH_FULL_CHUNK_SIZE > 0
-        # Chunks típicos: 4KB–64KB
+        # E3: 1 MB (era 8 KB) para minimizar iterações/syscalls em arquivos grandes.
         assert 1024 <= config.HASH_FULL_CHUNK_SIZE <= 1024 * 1024
 
     def test_hash_cache_mtime_tolerance(self):
