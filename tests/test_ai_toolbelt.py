@@ -119,6 +119,38 @@ class TestRateLimiter:
         # Agora deve permitir nova execução
         assert tb._check_rate_limit() is None
 
+    def test_reserve_slot_records_atomically(self):
+        """S8: _reserve_exec_slot conta o slot já na reserva."""
+        for _ in range(tb._MAX_EXEC_PER_MINUTE):
+            assert tb._reserve_exec_slot() is None
+        # Esgotado — a próxima reserva é negada.
+        result = tb._reserve_exec_slot()
+        assert result is not None
+        assert result["error"] == "RATE_LIMIT_EXCEEDED"
+
+    def test_reserve_slot_concurrent_respects_limit(self):
+        """S8: sob concorrência, no máx _MAX_EXEC_PER_MINUTE reservas passam."""
+        import threading
+
+        results: list = []
+        lock = threading.Lock()
+
+        def worker():
+            r = tb._reserve_exec_slot()
+            with lock:
+                results.append(r)
+
+        threads = [threading.Thread(target=worker) for _ in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        granted = [r for r in results if r is None]
+        assert len(granted) == tb._MAX_EXEC_PER_MINUTE, (
+            f"esperava {tb._MAX_EXEC_PER_MINUTE} reservas, obteve {len(granted)}"
+        )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Token store
@@ -140,11 +172,36 @@ class TestTokenStore:
         tok = tb.request_confirmation("move_to_trash", {"path": "D:/x.mp4"})
         token = tok["token"]
         # Primeiro uso: válido
-        assert tb._validate_token(token, "move_to_trash") is None
+        assert tb._validate_token(token, "move_to_trash", {"path": "D:/x.mp4"}) is None
         # Segundo uso: inválido (token consumido)
-        err = tb._validate_token(token, "move_to_trash")
+        err = tb._validate_token(token, "move_to_trash", {"path": "D:/x.mp4"})
         assert err is not None
         assert err["error"] == "INVALID_TOKEN"
+
+    def test_token_one_shot_under_concurrency(self):
+        """S8: sob concorrência, exatamente UMA validação do mesmo token vence."""
+        import threading
+
+        tok = tb.request_confirmation("move_to_trash", {"path": "D:/y.mp4"})
+        token = tok["token"]
+        results: list = []
+        lock = threading.Lock()
+
+        def worker():
+            r = tb._validate_token(token, "move_to_trash", {"path": "D:/y.mp4"})
+            with lock:
+                results.append(r)
+
+        threads = [threading.Thread(target=worker) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        succeeded = [r for r in results if r is None]
+        assert len(succeeded) == 1, (
+            f"token one-shot deveria vencer 1x, venceu {len(succeeded)}x"
+        )
 
     def test_wrong_action_returns_mismatch(self):
         tok = tb.request_confirmation("move_file", {})

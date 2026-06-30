@@ -28,6 +28,7 @@ import json
 import logging
 import secrets
 import shutil
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -78,6 +79,14 @@ _TOKEN_TTL_SECONDS: int = AI_TOKEN_TTL_SECONDS
 # Token store (in-memory, escopo por processo)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Hardening S8: lock reentrante que protege token store E rate limiter. Sob
+# clientes MCP concorrentes, sem ele duas chamadas poderiam consumir o mesmo
+# token one-shot (TOCTOU entre get e del) ou furar o rate-limit (check antes de
+# qualquer record). RLock permite aninhamento (ex.: _validate_token →
+# _clean_expired_tokens).
+_state_lock = threading.RLock()
+
+
 @dataclass
 class _ConfirmationToken:
     token: str
@@ -119,10 +128,11 @@ def _fingerprint_args(args: dict) -> str:
 
 
 def _clean_expired_tokens() -> None:
-    now = time.time()
-    expired = [t for t, v in _token_store.items() if v.expires_at <= now]
-    for t in expired:
-        del _token_store[t]
+    with _state_lock:
+        now = time.time()
+        expired = [t for t, v in _token_store.items() if v.expires_at <= now]
+        for t in expired:
+            del _token_store[t]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -132,24 +142,49 @@ def _clean_expired_tokens() -> None:
 _exec_timestamps: list[float] = []
 
 
+def _rate_limit_error() -> dict:
+    return {
+        "error": "RATE_LIMIT_EXCEEDED",
+        "message": (
+            f"Limite de {_MAX_EXEC_PER_MINUTE} ações executivas por minuto atingido. "
+            "Aguarde antes de continuar."
+        ),
+    }
+
+
 def _check_rate_limit() -> dict | None:
-    """Verifica rate limit. Retorna dict de erro se excedido, None se OK."""
+    """Verifica rate limit (somente leitura). Retorna erro se excedido."""
     global _exec_timestamps
-    now = time.time()
-    _exec_timestamps = [t for t in _exec_timestamps if now - t < 60]
-    if len(_exec_timestamps) >= _MAX_EXEC_PER_MINUTE:
-        return {
-            "error": "RATE_LIMIT_EXCEEDED",
-            "message": (
-                f"Limite de {_MAX_EXEC_PER_MINUTE} ações executivas por minuto atingido. "
-                "Aguarde antes de continuar."
-            ),
-        }
-    return None
+    with _state_lock:
+        now = time.time()
+        _exec_timestamps = [t for t in _exec_timestamps if now - t < 60]
+        if len(_exec_timestamps) >= _MAX_EXEC_PER_MINUTE:
+            return _rate_limit_error()
+        return None
 
 
 def _record_exec() -> None:
-    _exec_timestamps.append(time.time())
+    with _state_lock:
+        _exec_timestamps.append(time.time())
+
+
+def _reserve_exec_slot() -> dict | None:
+    """
+    Hardening S8: verifica E reserva um slot de execução ATOMICAMENTE.
+
+    Substitui o par check→(I/O)→record nas funções executivas, fechando a
+    janela TOCTOU em que N chamadas concorrentes passavam o check antes de
+    qualquer record e furavam o rate-limit. O slot é contado já na reserva
+    (throttle de tentativas, não só de sucessos).
+    """
+    global _exec_timestamps
+    with _state_lock:
+        now = time.time()
+        _exec_timestamps = [t for t in _exec_timestamps if now - t < 60]
+        if len(_exec_timestamps) >= _MAX_EXEC_PER_MINUTE:
+            return _rate_limit_error()
+        _exec_timestamps.append(now)
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -235,46 +270,50 @@ def _validate_token(
     comportamento antigo (sem checagem de args) — APIs de produção devem
     sempre passar `call_args`.
     """
-    ct = _token_store.get(token)
-    if ct is None:
-        _clean_expired_tokens()  # housekeeping passivo
-        return {
-            "error": "INVALID_TOKEN",
-            "message": "Token inválido ou expirado. Solicite um novo via request_confirmation.",
-        }
-    if ct.expires_at <= time.time():
-        del _token_store[token]
-        _clean_expired_tokens()
-        return {
-            "error": "TOKEN_EXPIRED",
-            "message": "Token expirado. Solicite um novo via request_confirmation.",
-        }
-    if ct.action != action:
-        return {
-            "error": "TOKEN_MISMATCH",
-            "message": f"Token emitido para '{ct.action}', não para '{action}'.",
-        }
-    if call_args is not None:
-        actual_fp = _fingerprint_args(call_args)
-        if actual_fp != ct.args_fingerprint:
-            # Não consumimos o token aqui — deixamos a IA tentar de novo
-            # com argumentos corretos. Mas log a tentativa.
-            logger.warning(
-                "Token args mismatch para action=%s. Confirmado=%s, chamado=%s",
-                action,
-                sorted(ct.args.keys()),
-                sorted(call_args.keys()),
-            )
+    # Hardening S8: toda a validação+consumo é atômica sob _state_lock, para
+    # que duas chamadas concorrentes não passem ambas pelo .get() antes do del
+    # e reusem o mesmo token one-shot.
+    with _state_lock:
+        ct = _token_store.get(token)
+        if ct is None:
+            _clean_expired_tokens()  # housekeeping passivo
             return {
-                "error": "TOKEN_ARGS_MISMATCH",
-                "message": (
-                    "Token foi emitido para argumentos diferentes dos passados "
-                    "agora. Solicite um novo token via request_confirmation com "
-                    "os argumentos exatos da chamada."
-                ),
+                "error": "INVALID_TOKEN",
+                "message": "Token inválido ou expirado. Solicite um novo via request_confirmation.",
             }
-    del _token_store[token]  # one-shot: consumir após validação
-    return None
+        if ct.expires_at <= time.time():
+            del _token_store[token]
+            _clean_expired_tokens()
+            return {
+                "error": "TOKEN_EXPIRED",
+                "message": "Token expirado. Solicite um novo via request_confirmation.",
+            }
+        if ct.action != action:
+            return {
+                "error": "TOKEN_MISMATCH",
+                "message": f"Token emitido para '{ct.action}', não para '{action}'.",
+            }
+        if call_args is not None:
+            actual_fp = _fingerprint_args(call_args)
+            if actual_fp != ct.args_fingerprint:
+                # Não consumimos o token aqui — deixamos a IA tentar de novo
+                # com argumentos corretos. Mas log a tentativa.
+                logger.warning(
+                    "Token args mismatch para action=%s. Confirmado=%s, chamado=%s",
+                    action,
+                    sorted(ct.args.keys()),
+                    sorted(call_args.keys()),
+                )
+                return {
+                    "error": "TOKEN_ARGS_MISMATCH",
+                    "message": (
+                        "Token foi emitido para argumentos diferentes dos passados "
+                        "agora. Solicite um novo token via request_confirmation com "
+                        "os argumentos exatos da chamada."
+                    ),
+                }
+        del _token_store[token]  # one-shot: consumir após validação
+        return None
 
 
 def _fmt_ts(ts: float | None) -> str | None:
@@ -296,12 +335,14 @@ def _open_db() -> StorageManagerDB:
 def _reset_rate_limiter() -> None:
     """Limpa o histórico de rate limiting. Apenas para uso em testes."""
     global _exec_timestamps
-    _exec_timestamps = []
+    with _state_lock:
+        _exec_timestamps = []
 
 
 def _reset_token_store() -> None:
     """Limpa todos os tokens. Apenas para uso em testes."""
-    _token_store.clear()
+    with _state_lock:
+        _token_store.clear()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -593,13 +634,14 @@ def request_confirmation(action: str, args: dict) -> dict:
 
     token = secrets.token_hex(16)
     expires_at = time.time() + _TOKEN_TTL_SECONDS
-    _token_store[token] = _ConfirmationToken(
-        token=token,
-        action=action,
-        args=args,
-        args_fingerprint=_fingerprint_args(args or {}),
-        expires_at=expires_at,
-    )
+    with _state_lock:
+        _token_store[token] = _ConfirmationToken(
+            token=token,
+            action=action,
+            args=args,
+            args_fingerprint=_fingerprint_args(args or {}),
+            expires_at=expires_at,
+        )
 
     return {
         "token": token,
@@ -658,7 +700,7 @@ def move_to_trash(
         confirmation_token, "move_to_trash", {"path": path}
     ):
         return err
-    if err := _check_rate_limit():
+    if err := _reserve_exec_slot():
         return err
     if err := _assert_safe(path, role="caminho"):
         return err
@@ -684,7 +726,7 @@ def move_to_trash(
 
     try:
         _send2trash(str(p))
-        _record_exec()
+        # Slot de execução já reservado em _reserve_exec_slot() (S8).
         with _open_db() as db:
             op_id = db.insert_operation(
                 timestamp=time.time(),
@@ -731,7 +773,7 @@ def move_file(
         {"source_path": source_path, "target_path": target_path},
     ):
         return err
-    if err := _check_rate_limit():
+    if err := _reserve_exec_slot():
         return err
     # Sprint 7.2 (S-1, S-4): validar AMBOS origem e destino antes de qualquer I/O.
     if err := _assert_safe(source_path, role="origem"):
@@ -757,7 +799,7 @@ def move_file(
             target_path = str(dst)
 
         shutil.move(str(src), str(dst))
-        _record_exec()
+        # Slot já reservado em _reserve_exec_slot() (S8).
 
         with _open_db() as db:
             op_id = db.insert_operation(
@@ -802,7 +844,7 @@ def apply_suggestion(
         confirmation_token, "apply_suggestion", {"suggestion_id": suggestion_id}
     ):
         return err
-    if err := _check_rate_limit():
+    if err := _reserve_exec_slot():
         return err
 
     try:
@@ -844,7 +886,7 @@ def apply_suggestion(
                 }
             _send2trash(str(p))
 
-            _record_exec()
+            # Slot já reservado em _reserve_exec_slot() (S8).
             with _open_db() as db:
                 op_id = db.insert_operation(
                     timestamp=time.time(),
@@ -885,7 +927,7 @@ def apply_suggestion(
                 target_path = str(dst)
 
             shutil.move(str(p), str(dst))
-            _record_exec()
+            # Slot já reservado em _reserve_exec_slot() (S8).
 
             with _open_db() as db:
                 op_id = db.insert_operation(
@@ -934,7 +976,7 @@ def undo_last_operation(
         {"operation_id": operation_id},
     ):
         return err
-    if err := _check_rate_limit():
+    if err := _reserve_exec_slot():
         return err
 
     try:
@@ -976,7 +1018,7 @@ def undo_last_operation(
 
         Path(restore_path).parent.mkdir(parents=True, exist_ok=True)
         shutil.move(current_path, restore_path)
-        _record_exec()
+        # Slot já reservado em _reserve_exec_slot() (S8).
 
         with _open_db() as db:
             op_id = db.insert_operation(
@@ -1023,7 +1065,7 @@ def set_disk_role(
         {"drive_letter": drive_letter, "role": role},
     ):
         return err
-    if err := _check_rate_limit():
+    if err := _reserve_exec_slot():
         return err
     if role not in VALID_DISK_ROLES:
         return {
@@ -1033,7 +1075,7 @@ def set_disk_role(
     try:
         with _open_db() as db:
             db.set_disk_role(drive_letter, role)
-        _record_exec()
+        # Slot já reservado em _reserve_exec_slot() (S8).
         normalized = drive_letter.strip().upper().rstrip(":\\/") + ":"
         return {
             "success": True,

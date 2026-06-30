@@ -206,3 +206,38 @@ class TestValidatePathResolveError:
             ok, err = validate_path("C:\\other_absolute\\file.bin")
         assert not ok
         assert err
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hardening S7 — prefixo estendido \\?\ e match por componentes
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestExtendedPrefixHardening:
+    def test_extended_prefix_windows_blocked(self):
+        r"""\\?\C:\Windows não pode burlar o guard (bypass do startswith)."""
+        ok, err = validate_path(
+            "\\\\?\\C:\\Windows\\System32\\drivers\\etc\\hosts"
+        )
+        assert not ok
+        assert err
+
+    def test_extended_prefix_program_files_blocked(self):
+        ok, err = validate_path("\\\\?\\C:\\Program Files\\app\\app.exe")
+        assert not ok
+
+    def test_windowsapps_boundary_not_false_positive(self):
+        """C:\\WindowsApps NÃO é C:\\Windows — não deve ser bloqueado."""
+        ok, err = validate_path("C:\\WindowsApps\\meu_app\\dados.bin")
+        assert ok
+        assert err == ""
+
+    def test_windows_backup_boundary_allowed(self):
+        ok, err = validate_path("C:\\Windows-Backup\\save.dat")
+        assert ok
+        assert err == ""
+
+    def test_program_files_suffix_boundary_allowed(self):
+        """C:\\Program FilesXYZ não casa o prefixo C:\\Program Files."""
+        ok, err = validate_path("C:\\Program FilesXYZ\\data.bin")
+        assert ok
+        assert err == ""
