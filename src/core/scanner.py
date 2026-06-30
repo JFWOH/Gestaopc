@@ -13,6 +13,7 @@ Princípios de resiliência (Seção 5 da spec):
 
 from __future__ import annotations
 
+import heapq
 import json
 import logging
 import os
@@ -268,7 +269,15 @@ class StorageScanner:
             logger.error("Diretório raiz não encontrado: %s", root)
             return []
 
-        entries: list[FileEntry] = []
+        # E2 (Sprint de Escala): manter apenas um min-heap de tamanho N durante o
+        # walk, em vez de materializar TODOS os arquivos numa lista para depois
+        # ordenar. Memória O(N) (e não O(total de arquivos varridos)) e tempo
+        # O(M log N) — evita picos de RAM em discos com milhões de arquivos.
+        # heap de (size_bytes, seq, FileEntry); seq desempata sem comparar
+        # FileEntry (que não é ordenável).
+        heap: list[tuple[int, int, FileEntry]] = []
+        seq = 0
+        scanned = 0
 
         for dirpath, dirnames, filenames in os.walk(root):
             # ------ Podar diretórios protegidos do sistema (Seção 5) ------
@@ -290,22 +299,27 @@ class StorageScanner:
                     )
                     continue
 
-                category = self._categorize(fname)
-                entries.append(FileEntry(
+                scanned += 1
+                entry = FileEntry(
                     path=filepath,
                     size_bytes=st.st_size,
-                    category=category,
+                    category=self._categorize(fname),
                     modified_time=st.st_mtime,
-                ))
+                )
+                seq += 1
+                if len(heap) < n:
+                    heapq.heappush(heap, (st.st_size, seq, entry))
+                elif n > 0 and st.st_size > heap[0][0]:
+                    # Maior que o menor do top atual — substitui (mantém os N maiores).
+                    heapq.heapreplace(heap, (st.st_size, seq, entry))
 
-        # Ordenar do maior para o menor e retornar o top N.
-        entries.sort(key=lambda e: e.size_bytes, reverse=True)
-        top = entries[:n]
+        # Ordenar o heap (≤ N itens) do maior para o menor.
+        top = [e for _, _, e in sorted(heap, key=lambda t: (t[0], t[1]), reverse=True)]
 
         logger.info(
             "Varredura de '%s' concluída: %d arquivos verificados, top %d retornados.",
             root,
-            len(entries),
+            scanned,
             len(top),
         )
         return top

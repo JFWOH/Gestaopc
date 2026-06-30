@@ -200,6 +200,23 @@ class TestTopLargestFiles:
                 f"modified_time inválido: {f.modified_time} para {f.path}"
             )
 
+    def test_heap_returns_the_n_largest(self, tmp_path: Path):
+        """E2: com mais arquivos que N, retorna exatamente os N maiores."""
+        scanner = StorageScanner()
+        # 10 arquivos com tamanhos distintos 100, 200, ..., 1000 bytes.
+        for i in range(1, 11):
+            (tmp_path / f"f{i:02d}.bin").write_bytes(b"\x00" * (i * 100))
+
+        files = scanner.top_largest_files(tmp_path, n=3)
+        sizes = [f.size_bytes for f in files]
+        assert sizes == [1000, 900, 800], "deve trazer só os 3 maiores, em ordem"
+
+    def test_heap_n_zero_returns_empty(self, tmp_path: Path):
+        """E2: n=0 não deve quebrar e retorna lista vazia."""
+        scanner = StorageScanner()
+        (tmp_path / "a.bin").write_bytes(b"\x00" * 100)
+        assert scanner.top_largest_files(tmp_path, n=0) == []
+
 
 # ---------------------------------------------------------------------------
 # list_partitions() — com mock do psutil
