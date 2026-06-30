@@ -17,9 +17,8 @@ import json
 import logging
 import os
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import psutil
 
@@ -41,13 +40,51 @@ SYSTEM_EXCLUDED_DIRS: set[str] = {
 }
 
 # Extensões agrupadas por categoria (Seção 3.2 da spec).
+# Sprint 6.4: adicionadas categorias "Áudio" e "Modelos IA" — arquivos antes
+# classificados como "Outros" (perdendo prioridade de realocação) agora são
+# reconhecidos. Os conjuntos são disjuntos (nenhuma extensão em 2 categorias).
 FILE_CATEGORIES: dict[str, set[str]] = {
     "Imagens": {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg", ".tiff", ".ico"},
     "Vídeos": {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v"},
+    "Áudio": {".mp3", ".flac", ".wav", ".aac", ".ogg", ".m4a"},
     "Documentos": {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".txt", ".csv", ".odt"},
     "Executáveis": {".exe", ".msi", ".bat", ".cmd", ".ps1", ".com"},
     "Compactados": {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".iso"},
+    "Modelos IA": {".gguf", ".safetensors", ".bin"},
 }
+
+# Script PowerShell para detecção de tipo de mídia física por letra de drive.
+# Usa Get-Partition por DiskNumber (funciona sem elevação de admin).
+# Sprint 6.3: o fallback de bus/mídia desconhecidos é 'Desconhecido' — NÃO 'SSD'.
+# Classificar um disco USB lento, Thunderbolt ou SD card silenciosamente como
+# SSD era enganoso; 'Desconhecido' é honesto e bate com o default de PartitionInfo.
+_MEDIA_TYPE_PS_SCRIPT: str = """
+$result = @{}
+try {
+    $disks = Get-PhysicalDisk -ErrorAction Stop
+    $parts = Get-Partition -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter }
+    foreach ($p in $parts) {
+        $letter = "$($p.DriveLetter):"
+        $disk = $disks | Where-Object { $_.DeviceId -eq [string]$p.DiskNumber }
+        if ($disk) {
+            $busType = $disk.BusType
+            $mediaType = $disk.MediaType
+            if ($busType -eq 'NVMe') {
+                $result[$letter] = 'NVMe'
+            } elseif ($mediaType -eq 'SSD') {
+                $result[$letter] = 'SSD'
+            } elseif ($mediaType -eq 'HDD') {
+                $result[$letter] = 'HDD'
+            } elseif ($busType -eq 'USB') {
+                $result[$letter] = 'HDD'
+            } else {
+                $result[$letter] = 'Desconhecido'
+            }
+        }
+    }
+} catch {}
+$result | ConvertTo-Json -Compress
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +222,18 @@ class StorageScanner:
                 )
             )
 
+        # RECON 8.3.4 — quando a detecção de tipo de mídia falha totalmente
+        # (PowerShell ausente/restrito, timeout, JSON inválido), _detect_media_types
+        # retorna {} silenciosamente e TODOS os discos viram "Desconhecido". Sem
+        # este aviso, o INFO de sucesso abaixo mascararia a degradação. O WARNING
+        # chega à status bar via QtLogBridge (root logger, nível INFO captura WARNING).
+        if partitions and not media_map:
+            logger.warning(
+                "Detecção de tipo de disco indisponível — todos os discos marcados "
+                "como 'Desconhecido'. Sugestões de realocação por tipo de mídia "
+                "(NVMe/SSD/HDD) podem ficar imprecisas."
+            )
+
         logger.info("Partições mapeadas: %d encontradas.", len(partitions))
         return partitions
 
@@ -283,9 +332,10 @@ class StorageScanner:
         """
         Identifica os *n* diretórios que mais consomem espaço.
 
-        Varre subdiretórios até *max_depth* níveis de profundidade,
-        calculando o tamanho total (soma recursiva dos arquivos).
-        Diretórios protegidos do sistema são ignorados.
+        Lista os subdiretórios imediatos de *root_dir* e calcula, para cada um,
+        o tamanho total **recursivo completo** (soma de todos os arquivos em
+        qualquer nível de profundidade). Diretórios protegidos do sistema são
+        ignorados.
 
         Parameters
         ----------
@@ -294,7 +344,11 @@ class StorageScanner:
         n:
             Quantidade de diretórios a retornar (default 20).
         max_depth:
-            Profundidade máxima de subdiretórios a analisar.
+            Retido por compatibilidade de assinatura (chamadores existentes
+            ainda o passam). Sprint 6.1: **não limita mais** a soma de tamanho —
+            antes, pastas além de ``max_depth`` níveis eram subcontadas (uma
+            pasta com 50 GB em ``nivel3/`` aparecia com 0 bytes). A soma agora
+            é sempre o total real da árvore.
 
         Returns
         -------
@@ -347,7 +401,16 @@ class StorageScanner:
         current_depth: int = 0,
     ) -> tuple[int, int]:
         """
-        Calcula tamanho total e contagem de arquivos de um diretório recursivamente.
+        Calcula tamanho total e contagem de arquivos de um diretório,
+        recursando por **toda** a árvore (Sprint 6.1).
+
+        Parameters
+        ----------
+        max_depth, current_depth:
+            Retidos por compatibilidade de assinatura. **Não limitam mais** a
+            recursão — a soma percorre todos os níveis para devolver o tamanho
+            real. Diretórios protegidos (:data:`SYSTEM_EXCLUDED_DIRS`) continuam
+            sendo pulados em qualquer profundidade.
 
         Returns
         -------
@@ -365,7 +428,6 @@ class StorageScanner:
                         file_count += 1
                     elif (
                         entry.is_dir(follow_symlinks=False)
-                        and current_depth < max_depth
                         and entry.name not in SYSTEM_EXCLUDED_DIRS
                     ):
                         sub_size, sub_count = StorageScanner._dir_size_recursive(
@@ -394,38 +456,9 @@ class StorageScanner:
             Mapa de letra do drive (ex: ``"C:"``) para tipo
             (``"NVMe"``, ``"SSD"``, ``"HDD"``, ``"Desconhecido"``).
         """
-        # Script PowerShell que retorna JSON com o mapeamento.
-        # Usa Get-Partition por DiskNumber (funciona sem elevação de admin).
-        ps_script = """
-$result = @{}
-try {
-    $disks = Get-PhysicalDisk -ErrorAction Stop
-    $parts = Get-Partition -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter }
-    foreach ($p in $parts) {
-        $letter = "$($p.DriveLetter):"
-        $disk = $disks | Where-Object { $_.DeviceId -eq [string]$p.DiskNumber }
-        if ($disk) {
-            $busType = $disk.BusType
-            $mediaType = $disk.MediaType
-            if ($busType -eq 'NVMe') {
-                $result[$letter] = 'NVMe'
-            } elseif ($mediaType -eq 'SSD') {
-                $result[$letter] = 'SSD'
-            } elseif ($mediaType -eq 'HDD') {
-                $result[$letter] = 'HDD'
-            } elseif ($busType -eq 'USB') {
-                $result[$letter] = 'HDD'
-            } else {
-                $result[$letter] = 'SSD'
-            }
-        }
-    }
-} catch {}
-$result | ConvertTo-Json -Compress
-"""
         try:
             proc = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps_script],
+                ["powershell", "-NoProfile", "-Command", _MEDIA_TYPE_PS_SCRIPT],
                 capture_output=True,
                 text=True,
                 timeout=15,

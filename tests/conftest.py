@@ -15,6 +15,53 @@ from src.core.scanner import FileEntry, PartitionInfo
 
 
 # ---------------------------------------------------------------------------
+# Segmentação de testes — RECON 8.3.5
+# ---------------------------------------------------------------------------
+# Classificação single-source-of-truth: cada arquivo de teste é marcado
+# automaticamente como `unit` ou `integration` por este hook, evitando
+# espalhar `pytestmark` (e o risco de E402 após importorskip) por 16 arquivos.
+#
+#   unit         → mocks/tmp_path puro, sem I/O pesado, subprocess ou Qt widgets
+#   integration  → real I/O, SQLite em disco, Qt widgets, threads, hashing SHA-256
+#
+# `pytest -m unit` dá feedback rápido; `pytest -m integration` roda o resto.
+# Os markers estão registrados em pyproject.toml ([tool.pytest.ini_options]).
+
+_UNIT_TEST_FILES = frozenset({
+    "test_config.py",
+    "test_path_guard.py",
+    "test_hash_cache.py",
+    "test_skills_loader.py",
+    "test_ollama_client.py",   # HTTP totalmente mockado
+    "test_mcp_server.py",      # patches tb, sem rede
+    "test_ai_toolbelt.py",
+    "test_ai_backend.py",      # conformidade estrutural do Protocol (Fase C)
+})
+
+_INTEGRATION_TEST_FILES = frozenset({
+    "test_executor.py",
+    "test_scanner.py",
+    "test_analyzer.py",
+    "test_scan_status_panel.py",
+    "test_assistant_tab_lifecycle.py",
+    "test_telemetry.py",
+    "test_storage_db.py",
+    "test_workers_signals.py",
+    "test_log_bridge.py",
+})
+
+
+def pytest_collection_modifyitems(config, items):
+    """Aplica os markers unit/integration por arquivo de origem do teste."""
+    for item in items:
+        filename = os.path.basename(str(item.fspath))
+        if filename in _UNIT_TEST_FILES:
+            item.add_marker(pytest.mark.unit)
+        elif filename in _INTEGRATION_TEST_FILES:
+            item.add_marker(pytest.mark.integration)
+
+
+# ---------------------------------------------------------------------------
 # QApplication — fixture de sessão única (Sprint 7.3.1)
 # ---------------------------------------------------------------------------
 # PySide6 (e Qt em geral) só permite UMA instância de QCoreApplication-derived

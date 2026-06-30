@@ -25,7 +25,7 @@ Uso::
 
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +57,36 @@ PROTECTED_FILENAMES: frozenset[str] = frozenset({
     "io.sys",
     "msdos.sys",
 })
+
+
+# ---------------------------------------------------------------------------
+# Normalização (Hardening S7)
+# ---------------------------------------------------------------------------
+
+def _strip_extended_prefix(s: str) -> str:
+    """
+    Remove o prefixo de caminho estendido do Windows (``\\\\?\\``).
+
+    ``Path.resolve()`` pode devolver caminhos longos com o prefixo ``\\\\?\\``
+    (ou ``\\\\?\\UNC\\`` para UNC). Sem removê-lo, ``\\\\?\\C:\\Windows`` NÃO
+    casaria o prefixo protegido ``C:\\WINDOWS`` — um bypass do guard.
+    """
+    if s.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + s[len("\\\\?\\UNC\\"):]
+    if s.startswith("\\\\?\\"):
+        return s[len("\\\\?\\"):]
+    return s
+
+
+def _parts_upper(s: str) -> tuple[str, ...]:
+    """Componentes do caminho em maiúsculas (comparação case-insensitive)."""
+    return tuple(part.upper() for part in PureWindowsPath(s).parts)
+
+
+# Prefixos protegidos pré-decompostos em componentes, uma vez.
+_PROTECTED_PREFIX_PARTS: tuple[tuple[str, ...], ...] = tuple(
+    _parts_upper(prefix) for prefix in PROTECTED_PATH_PREFIXES
+)
 
 
 # ---------------------------------------------------------------------------
@@ -104,11 +134,15 @@ def validate_path(path: str) -> tuple[bool, str]:
     except (OSError, ValueError) as exc:
         return False, f"Caminho inválido ou inacessível: {exc}"
 
-    resolved_upper = str(resolved).upper()
+    # Hardening S7 — normalizar o prefixo estendido (\\?\) e comparar por
+    # COMPONENTES de caminho, não por startswith de string. Isso fecha o bypass
+    # via \\?\C:\Windows e elimina falsos positivos de fronteira (ex.:
+    # C:\WindowsApps não é mais confundido com C:\Windows).
+    resolved_parts = _parts_upper(_strip_extended_prefix(str(resolved)))
 
-    # Regra 3 — Verificar diretórios protegidos
-    for prefix in PROTECTED_PATH_PREFIXES:
-        if resolved_upper.startswith(prefix):
+    # Regra 3 — Verificar diretórios protegidos (match por componentes)
+    for prefix, prefix_parts in zip(PROTECTED_PATH_PREFIXES, _PROTECTED_PREFIX_PARTS):
+        if resolved_parts[: len(prefix_parts)] == prefix_parts:
             return False, (
                 f"Acesso a diretório de sistema protegido bloqueado: "
                 f"'{resolved}' está dentro de '{prefix}'."

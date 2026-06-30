@@ -19,9 +19,7 @@ Estratégia:
 from __future__ import annotations
 
 import json
-from io import BytesIO
-from typing import Iterator
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -303,21 +301,13 @@ class TestChatWithTools:
         assert tc["args"] == {"limit": 10}
 
     def test_tool_result_contains_executor_output(self, client):
-        idx = [_make_tool_resp("get_app_settings", {}), _make_text_resp("ok")]
-        executor = MagicMock(return_value={"theme": "dark"})
-
-        with patch.object(client, "chat_once", side_effect=lambda *a, **kw: next(iter(idx))):
-            # Re-iterate properly
-            pass
-
-        # Use proper iteration
         responses = iter([
             _make_tool_resp("get_app_settings", {}),
             _make_text_resp("Done."),
         ])
-        executor2 = MagicMock(return_value={"theme": "dark"})
+        executor = MagicMock(return_value={"theme": "dark"})
         with patch.object(client, "chat_once", side_effect=lambda *a, **kw: next(responses)):
-            events = list(client.chat_with_tools("m", [], self.TOOLS, executor2))
+            events = list(client.chat_with_tools("m", [], self.TOOLS, executor))
 
         tr = next(e for e in events if e["type"] == "tool_result")
         assert tr["result"] == {"theme": "dark"}

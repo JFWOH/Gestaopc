@@ -105,7 +105,8 @@ class OverviewTab(QWidget):
     @staticmethod
     def _set_stat(stat_layout: QVBoxLayout, value: str) -> None:
         """Atualiza o valor de um bloco de estatística."""
-        widget = stat_layout.itemAt(0).widget()
+        item = stat_layout.itemAt(0)
+        widget = item.widget() if item is not None else None
         if isinstance(widget, QLabel):
             widget.setText(value)
 

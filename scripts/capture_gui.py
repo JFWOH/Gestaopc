@@ -19,7 +19,7 @@ user32.SetForegroundWindow(hwnd)
 time.sleep(0.5)
 
 # Capturar screenshot
-from PIL import ImageGrab
+from PIL import ImageGrab  # noqa: E402  (import lazy: só ao capturar)
 time.sleep(0.3)
 img = ImageGrab.grab()
 img.save("screenshot_gui.png")

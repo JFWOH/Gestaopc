@@ -21,10 +21,10 @@ import pytest
 
 PySide6 = pytest.importorskip("PySide6")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication  # noqa: E402  (após importorskip)
 
-from src.core.scanner import PartitionInfo
-from src.gui.scan_status_panel import (
+from src.core.scanner import PartitionInfo  # noqa: E402  (após importorskip)
+from src.gui.scan_status_panel import (  # noqa: E402  (após importorskip)
     ScanStatusPanel,
     STATE_DONE,
     STATE_ERROR,

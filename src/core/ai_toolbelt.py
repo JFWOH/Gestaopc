@@ -26,14 +26,15 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import secrets
 import shutil
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from src.core.config import AI_MAX_EXEC_PER_MINUTE, AI_TOKEN_TTL_SECONDS
 from src.core.scanner import StorageScanner
 from src.core.storage_db import StorageManagerDB, get_default_db_path
 from src.core.path_guard import (
@@ -41,6 +42,10 @@ from src.core.path_guard import (
     PROTECTED_PATH_PREFIXES as _PG_PROTECTED_PATH_PREFIXES,
     validate_path,
 )
+
+# RECON 8.3.1 — get_tool_schemas (dados puros) extraido para tool_schemas.py;
+# re-exportado aqui para preservar ai_toolbelt.get_tool_schemas() (MCP/Ollama).
+from src.core.tool_schemas import get_tool_schemas  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +71,6 @@ EXECUTIVE_ACTIONS: set[str] = {
 }
 
 # Limites de execução — Sprint 7.6: valores canônicos em src/core/config.py.
-from src.core.config import AI_MAX_EXEC_PER_MINUTE, AI_TOKEN_TTL_SECONDS
-
 _MAX_EXEC_PER_MINUTE: int = AI_MAX_EXEC_PER_MINUTE
 _TOKEN_TTL_SECONDS: int = AI_TOKEN_TTL_SECONDS
 
@@ -75,6 +78,14 @@ _TOKEN_TTL_SECONDS: int = AI_TOKEN_TTL_SECONDS
 # ─────────────────────────────────────────────────────────────────────────────
 # Token store (in-memory, escopo por processo)
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Hardening S8: lock reentrante que protege token store E rate limiter. Sob
+# clientes MCP concorrentes, sem ele duas chamadas poderiam consumir o mesmo
+# token one-shot (TOCTOU entre get e del) ou furar o rate-limit (check antes de
+# qualquer record). RLock permite aninhamento (ex.: _validate_token →
+# _clean_expired_tokens).
+_state_lock = threading.RLock()
+
 
 @dataclass
 class _ConfirmationToken:
@@ -117,10 +128,11 @@ def _fingerprint_args(args: dict) -> str:
 
 
 def _clean_expired_tokens() -> None:
-    now = time.time()
-    expired = [t for t, v in _token_store.items() if v.expires_at <= now]
-    for t in expired:
-        del _token_store[t]
+    with _state_lock:
+        now = time.time()
+        expired = [t for t, v in _token_store.items() if v.expires_at <= now]
+        for t in expired:
+            del _token_store[t]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -130,24 +142,97 @@ def _clean_expired_tokens() -> None:
 _exec_timestamps: list[float] = []
 
 
+def _rate_limit_error() -> dict:
+    return {
+        "error": "RATE_LIMIT_EXCEEDED",
+        "message": (
+            f"Limite de {_MAX_EXEC_PER_MINUTE} ações executivas por minuto atingido. "
+            "Aguarde antes de continuar."
+        ),
+    }
+
+
 def _check_rate_limit() -> dict | None:
-    """Verifica rate limit. Retorna dict de erro se excedido, None se OK."""
+    """Verifica rate limit (somente leitura). Retorna erro se excedido."""
     global _exec_timestamps
-    now = time.time()
-    _exec_timestamps = [t for t in _exec_timestamps if now - t < 60]
-    if len(_exec_timestamps) >= _MAX_EXEC_PER_MINUTE:
-        return {
-            "error": "RATE_LIMIT_EXCEEDED",
-            "message": (
-                f"Limite de {_MAX_EXEC_PER_MINUTE} ações executivas por minuto atingido. "
-                "Aguarde antes de continuar."
-            ),
-        }
-    return None
+    with _state_lock:
+        now = time.time()
+        _exec_timestamps = [t for t in _exec_timestamps if now - t < 60]
+        if len(_exec_timestamps) >= _MAX_EXEC_PER_MINUTE:
+            return _rate_limit_error()
+        return None
 
 
 def _record_exec() -> None:
-    _exec_timestamps.append(time.time())
+    with _state_lock:
+        _exec_timestamps.append(time.time())
+
+
+def _reserve_exec_slot() -> dict | None:
+    """
+    Hardening S8: verifica E reserva um slot de execução ATOMICAMENTE.
+
+    Substitui o par check→(I/O)→record nas funções executivas, fechando a
+    janela TOCTOU em que N chamadas concorrentes passavam o check antes de
+    qualquer record e furavam o rate-limit. O slot é contado já na reserva
+    (throttle de tentativas, não só de sucessos).
+    """
+    global _exec_timestamps
+    with _state_lock:
+        now = time.time()
+        _exec_timestamps = [t for t in _exec_timestamps if now - t < 60]
+        if len(_exec_timestamps) >= _MAX_EXEC_PER_MINUTE:
+            return _rate_limit_error()
+        _exec_timestamps.append(now)
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Aprovação humana fora da banda (Hardening S5)
+# ─────────────────────────────────────────────────────────────────────────────
+# O "confirmation token" sozinho NÃO é consentimento humano — é a própria IA
+# que chama request_confirmation e usa o token no mesmo loop. Este seam permite
+# instalar um gate de aprovação REAL (ex.: a GUI mostra um diálogo modal ao
+# usuário). O hook recebe {action, description, risk_level, args} e devolve
+# True (autorizado) / False (negado).
+#
+# Default = nenhum hook → comportamento token-only (preserva back-compat, testes
+# e o servidor MCP, que pode instalar sua própria política). A GUI instala um
+# hook que exige clique humano antes de qualquer ação executiva.
+
+_approval_hook: Callable[[dict], bool] | None = None
+
+
+def set_approval_hook(hook: Callable[[dict], bool] | None) -> None:
+    """Instala (ou remove, com None) o gate de aprovação humana."""
+    global _approval_hook
+    _approval_hook = hook
+
+
+def _require_approval(action: str, args: dict) -> dict | None:
+    """
+    Consulta o hook de aprovação humana, se instalado. Retorna dict de erro
+    se negado, None se autorizado (ou se nenhum hook estiver instalado).
+    """
+    hook = _approval_hook
+    if hook is None:
+        return None
+    try:
+        approved = hook({
+            "action": action,
+            "description": _describe_action(action, args),
+            "risk_level": _assess_risk(action),
+            "args": args,
+        })
+    except Exception:
+        logger.exception("Hook de aprovação falhou — negando por segurança.")
+        approved = False
+    if not approved:
+        return {
+            "error": "APPROVAL_DENIED",
+            "message": "Ação executiva não foi aprovada pelo usuário.",
+        }
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -233,46 +318,50 @@ def _validate_token(
     comportamento antigo (sem checagem de args) — APIs de produção devem
     sempre passar `call_args`.
     """
-    ct = _token_store.get(token)
-    if ct is None:
-        _clean_expired_tokens()  # housekeeping passivo
-        return {
-            "error": "INVALID_TOKEN",
-            "message": "Token inválido ou expirado. Solicite um novo via request_confirmation.",
-        }
-    if ct.expires_at <= time.time():
-        del _token_store[token]
-        _clean_expired_tokens()
-        return {
-            "error": "TOKEN_EXPIRED",
-            "message": "Token expirado. Solicite um novo via request_confirmation.",
-        }
-    if ct.action != action:
-        return {
-            "error": "TOKEN_MISMATCH",
-            "message": f"Token emitido para '{ct.action}', não para '{action}'.",
-        }
-    if call_args is not None:
-        actual_fp = _fingerprint_args(call_args)
-        if actual_fp != ct.args_fingerprint:
-            # Não consumimos o token aqui — deixamos a IA tentar de novo
-            # com argumentos corretos. Mas log a tentativa.
-            logger.warning(
-                "Token args mismatch para action=%s. Confirmado=%s, chamado=%s",
-                action,
-                sorted(ct.args.keys()),
-                sorted(call_args.keys()),
-            )
+    # Hardening S8: toda a validação+consumo é atômica sob _state_lock, para
+    # que duas chamadas concorrentes não passem ambas pelo .get() antes do del
+    # e reusem o mesmo token one-shot.
+    with _state_lock:
+        ct = _token_store.get(token)
+        if ct is None:
+            _clean_expired_tokens()  # housekeeping passivo
             return {
-                "error": "TOKEN_ARGS_MISMATCH",
-                "message": (
-                    "Token foi emitido para argumentos diferentes dos passados "
-                    "agora. Solicite um novo token via request_confirmation com "
-                    "os argumentos exatos da chamada."
-                ),
+                "error": "INVALID_TOKEN",
+                "message": "Token inválido ou expirado. Solicite um novo via request_confirmation.",
             }
-    del _token_store[token]  # one-shot: consumir após validação
-    return None
+        if ct.expires_at <= time.time():
+            del _token_store[token]
+            _clean_expired_tokens()
+            return {
+                "error": "TOKEN_EXPIRED",
+                "message": "Token expirado. Solicite um novo via request_confirmation.",
+            }
+        if ct.action != action:
+            return {
+                "error": "TOKEN_MISMATCH",
+                "message": f"Token emitido para '{ct.action}', não para '{action}'.",
+            }
+        if call_args is not None:
+            actual_fp = _fingerprint_args(call_args)
+            if actual_fp != ct.args_fingerprint:
+                # Não consumimos o token aqui — deixamos a IA tentar de novo
+                # com argumentos corretos. Mas log a tentativa.
+                logger.warning(
+                    "Token args mismatch para action=%s. Confirmado=%s, chamado=%s",
+                    action,
+                    sorted(ct.args.keys()),
+                    sorted(call_args.keys()),
+                )
+                return {
+                    "error": "TOKEN_ARGS_MISMATCH",
+                    "message": (
+                        "Token foi emitido para argumentos diferentes dos passados "
+                        "agora. Solicite um novo token via request_confirmation com "
+                        "os argumentos exatos da chamada."
+                    ),
+                }
+        del _token_store[token]  # one-shot: consumir após validação
+        return None
 
 
 def _fmt_ts(ts: float | None) -> str | None:
@@ -294,12 +383,14 @@ def _open_db() -> StorageManagerDB:
 def _reset_rate_limiter() -> None:
     """Limpa o histórico de rate limiting. Apenas para uso em testes."""
     global _exec_timestamps
-    _exec_timestamps = []
+    with _state_lock:
+        _exec_timestamps = []
 
 
 def _reset_token_store() -> None:
     """Limpa todos os tokens. Apenas para uso em testes."""
-    _token_store.clear()
+    with _state_lock:
+        _token_store.clear()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -591,13 +682,14 @@ def request_confirmation(action: str, args: dict) -> dict:
 
     token = secrets.token_hex(16)
     expires_at = time.time() + _TOKEN_TTL_SECONDS
-    _token_store[token] = _ConfirmationToken(
-        token=token,
-        action=action,
-        args=args,
-        args_fingerprint=_fingerprint_args(args or {}),
-        expires_at=expires_at,
-    )
+    with _state_lock:
+        _token_store[token] = _ConfirmationToken(
+            token=token,
+            action=action,
+            args=args,
+            args_fingerprint=_fingerprint_args(args or {}),
+            expires_at=expires_at,
+        )
 
     return {
         "token": token,
@@ -656,7 +748,9 @@ def move_to_trash(
         confirmation_token, "move_to_trash", {"path": path}
     ):
         return err
-    if err := _check_rate_limit():
+    if err := _require_approval("move_to_trash", {"path": path}):
+        return err
+    if err := _reserve_exec_slot():
         return err
     if err := _assert_safe(path, role="caminho"):
         return err
@@ -665,31 +759,39 @@ def move_to_trash(
     if not p.exists():
         return {"error": "FILE_NOT_FOUND", "message": f"Arquivo não encontrado: {path}"}
 
+    # Hardening S10: a tool é anunciada como "reversível" (vai para a Lixeira).
+    # Se send2trash não estiver disponível, RECUSAR — nunca cair para unlink()
+    # permanente silencioso, que contradiria a descrição usada pela IA para
+    # avaliar o risco e causaria perda de dados irreversível.
     try:
-        used_trash = False
-        try:
-            from send2trash import send2trash as _send2trash
-            _send2trash(str(p))
-            used_trash = True
-        except ImportError:
-            p.unlink()
+        from send2trash import send2trash as _send2trash
+    except ImportError:
+        return {
+            "error": "TRASH_UNAVAILABLE",
+            "message": (
+                "Biblioteca send2trash indisponível — operação recusada para "
+                "evitar deleção PERMANENTE (não reversível). Instale send2trash."
+            ),
+        }
 
-        _record_exec()
+    try:
+        _send2trash(str(p))
+        # Slot de execução já reservado em _reserve_exec_slot() (S8).
         with _open_db() as db:
             op_id = db.insert_operation(
                 timestamp=time.time(),
                 action="DELETAR",
                 source_path=path,
                 success=True,
-                used_trash=used_trash,
+                used_trash=True,
                 source=ai_source,
             )
         return {
             "success": True,
             "path": path,
             "operation_id": op_id,
-            "used_trash": used_trash,
-            "message": "Arquivo enviado para Lixeira." if used_trash else "Arquivo deletado permanentemente.",
+            "used_trash": True,
+            "message": "Arquivo enviado para Lixeira.",
         }
     except PermissionError as exc:
         return {"error": "PERMISSION_DENIED", "message": f"Sem permissão (AV/bloqueio): {exc}"}
@@ -721,7 +823,11 @@ def move_file(
         {"source_path": source_path, "target_path": target_path},
     ):
         return err
-    if err := _check_rate_limit():
+    if err := _require_approval(
+        "move_file", {"source_path": source_path, "target_path": target_path}
+    ):
+        return err
+    if err := _reserve_exec_slot():
         return err
     # Sprint 7.2 (S-1, S-4): validar AMBOS origem e destino antes de qualquer I/O.
     if err := _assert_safe(source_path, role="origem"):
@@ -747,7 +853,7 @@ def move_file(
             target_path = str(dst)
 
         shutil.move(str(src), str(dst))
-        _record_exec()
+        # Slot já reservado em _reserve_exec_slot() (S8).
 
         with _open_db() as db:
             op_id = db.insert_operation(
@@ -792,7 +898,9 @@ def apply_suggestion(
         confirmation_token, "apply_suggestion", {"suggestion_id": suggestion_id}
     ):
         return err
-    if err := _check_rate_limit():
+    if err := _require_approval("apply_suggestion", {"suggestion_id": suggestion_id}):
+        return err
+    if err := _reserve_exec_slot():
         return err
 
     try:
@@ -821,22 +929,27 @@ def apply_suggestion(
             return {"error": "FILE_NOT_FOUND", "message": f"Arquivo não encontrado: {file_path}"}
 
         if action == "DELETAR":
-            used_trash = False
+            # Hardening S10: recusar se send2trash indisponível (ver move_to_trash).
             try:
                 from send2trash import send2trash as _send2trash
-                _send2trash(str(p))
-                used_trash = True
             except ImportError:
-                p.unlink()
+                return {
+                    "error": "TRASH_UNAVAILABLE",
+                    "message": (
+                        "Biblioteca send2trash indisponível — operação recusada "
+                        "para evitar deleção PERMANENTE. Instale send2trash."
+                    ),
+                }
+            _send2trash(str(p))
 
-            _record_exec()
+            # Slot já reservado em _reserve_exec_slot() (S8).
             with _open_db() as db:
                 op_id = db.insert_operation(
                     timestamp=time.time(),
                     action="DELETAR",
                     source_path=file_path,
                     success=True,
-                    used_trash=used_trash,
+                    used_trash=True,
                     source=ai_source,
                 )
                 db.mark_suggestion_executed(suggestion_id)
@@ -870,7 +983,7 @@ def apply_suggestion(
                 target_path = str(dst)
 
             shutil.move(str(p), str(dst))
-            _record_exec()
+            # Slot já reservado em _reserve_exec_slot() (S8).
 
             with _open_db() as db:
                 op_id = db.insert_operation(
@@ -919,7 +1032,9 @@ def undo_last_operation(
         {"operation_id": operation_id},
     ):
         return err
-    if err := _check_rate_limit():
+    if err := _require_approval("undo_last_operation", {"operation_id": operation_id}):
+        return err
+    if err := _reserve_exec_slot():
         return err
 
     try:
@@ -961,7 +1076,7 @@ def undo_last_operation(
 
         Path(restore_path).parent.mkdir(parents=True, exist_ok=True)
         shutil.move(current_path, restore_path)
-        _record_exec()
+        # Slot já reservado em _reserve_exec_slot() (S8).
 
         with _open_db() as db:
             op_id = db.insert_operation(
@@ -1008,7 +1123,11 @@ def set_disk_role(
         {"drive_letter": drive_letter, "role": role},
     ):
         return err
-    if err := _check_rate_limit():
+    if err := _require_approval(
+        "set_disk_role", {"drive_letter": drive_letter, "role": role}
+    ):
+        return err
+    if err := _reserve_exec_slot():
         return err
     if role not in VALID_DISK_ROLES:
         return {
@@ -1018,7 +1137,7 @@ def set_disk_role(
     try:
         with _open_db() as db:
             db.set_disk_role(drive_letter, role)
-        _record_exec()
+        # Slot já reservado em _reserve_exec_slot() (S8).
         normalized = drive_letter.strip().upper().rstrip(":\\/") + ":"
         return {
             "success": True,
@@ -1031,284 +1150,3 @@ def set_disk_role(
     except Exception as exc:
         logger.exception("Erro em set_disk_role")
         return {"error": "OPERATION_FAILED", "message": str(exc)}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Schema JSON das Tools (formato OpenAI/Ollama function-calling)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_tool_schemas() -> list[dict]:
-    """
-    Retorna schemas JSON de todas as 12 tools no formato OpenAI/Ollama.
-
-    Uso::
-
-        schemas = get_tool_schemas()
-        # Passar para OllamaClient.chat_with_tools() ou ao FastMCP
-    """
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": "list_partitions",
-                "description": "Lista todas as partições do sistema com espaço livre, total e tipo de mídia (NVMe/SSD/HDD).",
-                "parameters": {"type": "object", "properties": {}, "required": []},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "find_top_files",
-                "description": "Retorna os N maiores arquivos do índice do último scan, com categoria e caminho.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "limit": {
-                            "type": "integer",
-                            "description": "Quantos arquivos retornar (1–100, padrão 50).",
-                        },
-                        "category": {
-                            "type": "string",
-                            "description": "Filtrar por categoria: 'Vídeos', 'Imagens', 'Documentos', 'Executáveis', 'Compactados', 'Outros'.",
-                        },
-                        "drive_letter": {
-                            "type": "string",
-                            "description": "Filtrar por letra de disco, ex: 'C' ou 'D:'.",
-                        },
-                    },
-                    "required": [],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "find_top_folders",
-                "description": "Varre diretórios e retorna os N que mais consomem espaço.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "limit": {
-                            "type": "integer",
-                            "description": "Quantas pastas retornar (1–50, padrão 20).",
-                        },
-                        "drive_letter": {
-                            "type": "string",
-                            "description": "Varrer apenas este disco, ex: 'C' ou 'D:'. Omitir para varrer todos.",
-                        },
-                    },
-                    "required": [],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "find_duplicates",
-                "description": "Retorna grupos de arquivos duplicados do índice, ordenados por espaço desperdiçado.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "limit": {
-                            "type": "integer",
-                            "description": "Máximo de grupos (1–200, padrão 50).",
-                        },
-                        "min_size_mb": {
-                            "type": "number",
-                            "description": "Ignorar duplicatas menores que este tamanho em MB (padrão 1.0).",
-                        },
-                    },
-                    "required": [],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "list_suggestions",
-                "description": "Retorna sugestões de otimização geradas pelo Motor de Regras no último scan.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "include_dismissed": {
-                            "type": "boolean",
-                            "description": "Incluir sugestões já descartadas (padrão false).",
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Máximo de sugestões (1–100, padrão 20).",
-                        },
-                    },
-                    "required": [],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_history",
-                "description": "Retorna o histórico de operações realizadas (mover, deletar, desfazer).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "limit": {
-                            "type": "integer",
-                            "description": "Máximo de operações (1–200, padrão 20).",
-                        },
-                        "source": {
-                            "type": "string",
-                            "description": "Filtrar por origem: 'ui', 'ai:ollama' ou 'ai:mcp'.",
-                        },
-                    },
-                    "required": [],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_app_settings",
-                "description": "Retorna todas as configurações persistidas da aplicação como dicionário chave/valor.",
-                "parameters": {"type": "object", "properties": {}, "required": []},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "request_confirmation",
-                "description": (
-                    "Gera um token one-shot (válido por 60s) para autorizar uma ação executiva. "
-                    "SEMPRE chame esta tool antes de qualquer ação executiva (move_to_trash, "
-                    "move_file, apply_suggestion, undo_last_operation, set_disk_role). "
-                    "Use o token retornado no campo 'confirmation_token' da próxima chamada."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "description": "Nome da ação a autorizar: 'move_to_trash', 'move_file', 'apply_suggestion', 'undo_last_operation' ou 'set_disk_role'.",
-                        },
-                        "args": {
-                            "type": "object",
-                            "description": "Argumentos que serão passados à ação (para geração da descrição humana).",
-                        },
-                    },
-                    "required": ["action", "args"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "move_to_trash",
-                "description": "Envia um arquivo para a Lixeira do Windows (operação reversível). Requer token de confirmação.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Caminho absoluto do arquivo a enviar para Lixeira.",
-                        },
-                        "confirmation_token": {
-                            "type": "string",
-                            "description": "Token obtido via request_confirmation com action='move_to_trash'.",
-                        },
-                    },
-                    "required": ["path", "confirmation_token"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "move_file",
-                "description": "Move um arquivo de origem para destino. Requer token de confirmação.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "source_path": {
-                            "type": "string",
-                            "description": "Caminho absoluto do arquivo de origem.",
-                        },
-                        "target_path": {
-                            "type": "string",
-                            "description": "Caminho absoluto de destino (incluindo nome do arquivo).",
-                        },
-                        "confirmation_token": {
-                            "type": "string",
-                            "description": "Token obtido via request_confirmation com action='move_file'.",
-                        },
-                    },
-                    "required": ["source_path", "target_path", "confirmation_token"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "apply_suggestion",
-                "description": "Aplica uma sugestão do Motor de Regras pelo ID. Requer token de confirmação.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "suggestion_id": {
-                            "type": "integer",
-                            "description": "ID da sugestão (obtido via list_suggestions).",
-                        },
-                        "confirmation_token": {
-                            "type": "string",
-                            "description": "Token obtido via request_confirmation com action='apply_suggestion'.",
-                        },
-                    },
-                    "required": ["suggestion_id", "confirmation_token"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "undo_last_operation",
-                "description": "Desfaz a última operação de mover (ou uma específica por ID). Requer token de confirmação.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "confirmation_token": {
-                            "type": "string",
-                            "description": "Token obtido via request_confirmation com action='undo_last_operation'.",
-                        },
-                        "operation_id": {
-                            "type": "integer",
-                            "description": "ID específico da operação a desfazer (padrão: última MOVER bem-sucedida).",
-                        },
-                    },
-                    "required": ["confirmation_token"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "set_disk_role",
-                "description": "Atribui papel lógico a um disco, influenciando sugestões do Motor de Regras. Requer token.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "drive_letter": {
-                            "type": "string",
-                            "description": "Letra do disco, ex: 'C', 'D' ou 'D:'.",
-                        },
-                        "role": {
-                            "type": "string",
-                            "description": "Papel: 'primary', 'media', 'backup', 'external' ou 'none'.",
-                        },
-                        "confirmation_token": {
-                            "type": "string",
-                            "description": "Token obtido via request_confirmation com action='set_disk_role'.",
-                        },
-                    },
-                    "required": ["drive_letter", "role", "confirmation_token"],
-                },
-            },
-        },
-    ]

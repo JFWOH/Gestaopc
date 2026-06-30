@@ -22,7 +22,7 @@ from src.core.scanner import (
     FileEntry,
     PartitionInfo,
     FILE_CATEGORIES,
-    SYSTEM_EXCLUDED_DIRS,
+    _MEDIA_TYPE_PS_SCRIPT,
 )
 
 
@@ -66,8 +66,29 @@ class TestCategorize:
 
     def test_all_spec_categories_have_entries(self):
         """Garante que todas as categorias da spec são testáveis."""
-        expected = {"Imagens", "Vídeos", "Documentos", "Executáveis", "Compactados"}
+        # Sprint 6.4: "Áudio" e "Modelos IA" adicionadas.
+        expected = {
+            "Imagens", "Vídeos", "Áudio", "Documentos",
+            "Executáveis", "Compactados", "Modelos IA",
+        }
         assert set(FILE_CATEGORIES.keys()) == expected
+
+    @pytest.mark.parametrize("filename, expected_category", [
+        # Áudio (6.4) — antes caía em "Outros"
+        ("musica.mp3", "Áudio"),
+        ("trilha.FLAC", "Áudio"),
+        ("som.wav", "Áudio"),
+        ("podcast.m4a", "Áudio"),
+        ("audio.aac", "Áudio"),
+        ("stream.ogg", "Áudio"),
+        # Modelos de IA (6.4) — antes caía em "Outros"
+        ("llama3.gguf", "Modelos IA"),
+        ("model.SAFETENSORS", "Modelos IA"),
+        ("weights.bin", "Modelos IA"),
+    ])
+    def test_categorize_audio_and_ai_models(self, filename: str, expected_category: str):
+        """Regressão 6.4: áudio e modelos de IA não devem cair em 'Outros'."""
+        assert self.scanner._categorize(filename) == expected_category
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +266,62 @@ class TestListPartitions:
             partitions = scanner.list_partitions()
 
         assert len(partitions) == 0
+
+    def test_warns_when_media_detection_fails(self, caplog):
+        """RECON 8.3.4 — mapa de mídia vazio com partições presentes deve avisar."""
+        scanner = StorageScanner()
+
+        mock_part = MagicMock()
+        mock_part.mountpoint = "C:\\"
+        mock_part.fstype = "NTFS"
+        mock_part.opts = ""
+
+        mock_usage = MagicMock()
+        mock_usage.total = 500_000_000_000
+        mock_usage.used = 100_000_000_000
+        mock_usage.free = 400_000_000_000
+        mock_usage.percent = 20.0
+
+        with patch("psutil.disk_partitions", return_value=[mock_part]), \
+             patch("psutil.disk_usage", return_value=mock_usage), \
+             patch.object(StorageScanner, "_detect_media_types", return_value={}), \
+             caplog.at_level("WARNING"):
+
+            partitions = scanner.list_partitions()
+
+        assert len(partitions) == 1
+        assert partitions[0].media_type == "Desconhecido"
+        assert any(
+            "Detecção de tipo de disco indisponível" in rec.message
+            for rec in caplog.records
+        )
+
+    def test_no_warning_when_media_detected(self, caplog):
+        """Mapa de mídia presente NÃO deve emitir o aviso de degradação."""
+        scanner = StorageScanner()
+
+        mock_part = MagicMock()
+        mock_part.mountpoint = "C:\\"
+        mock_part.fstype = "NTFS"
+        mock_part.opts = ""
+
+        mock_usage = MagicMock()
+        mock_usage.total = 500_000_000_000
+        mock_usage.used = 100_000_000_000
+        mock_usage.free = 400_000_000_000
+        mock_usage.percent = 20.0
+
+        with patch("psutil.disk_partitions", return_value=[mock_part]), \
+             patch("psutil.disk_usage", return_value=mock_usage), \
+             patch.object(StorageScanner, "_detect_media_types", return_value={"C:": "NVMe"}), \
+             caplog.at_level("WARNING"):
+
+            scanner.list_partitions()
+
+        assert not any(
+            "Detecção de tipo de disco indisponível" in rec.message
+            for rec in caplog.records
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -494,25 +571,45 @@ class TestDirSizeRecursive:
         assert size == 800
         assert count == 2
 
-    def test_respects_max_depth(self, tmp_path: Path):
+    def test_sums_all_levels_ignoring_max_depth(self, tmp_path: Path):
+        """
+        Regressão 6.1: a soma agora percorre TODA a árvore, independentemente
+        de max_depth. Antes, com max_depth=1, deep.txt (nível 2) era excluído
+        e a pasta era subcontada.
+        """
         # depth 0: root file
         (tmp_path / "root.txt").write_bytes(b"\x00" * 1_000)
         # depth 1: sub
         sub = tmp_path / "sub"
         sub.mkdir()
         (sub / "sub.txt").write_bytes(b"\x00" * 500)
-        # depth 2: deep — deve ser excluído com max_depth=1
+        # depth 2: deep — antes era excluído com max_depth=1; agora deve contar
         deep = sub / "deep"
         deep.mkdir()
         (deep / "deep.txt").write_bytes(b"\x00" * 200)
 
-        # current_depth=0, max_depth=1 → sub é visitado (0 < 1),
-        # mas deep não (1 < 1 é False)
+        # max_depth=1 não limita mais a soma: todos os 3 arquivos contam.
         size, count = StorageScanner._dir_size_recursive(
             str(tmp_path), max_depth=1, current_depth=0
         )
-        assert size == 1_500   # root.txt + sub.txt (deep.txt excluído)
-        assert count == 2
+        assert size == 1_700   # root.txt + sub.txt + deep.txt
+        assert count == 3
+
+    def test_deep_nesting_fully_counted(self, tmp_path: Path):
+        """
+        Regressão 6.1: estrutura de 5 níveis (ex: node_modules, .git/objects)
+        deve ter o tamanho somado por completo, não subcontado.
+        """
+        current = tmp_path
+        # Cria nivel1/.../nivel5, cada um com um arquivo de 100 bytes.
+        for level in range(1, 6):
+            current = current / f"nivel{level}"
+            current.mkdir()
+            (current / f"f{level}.bin").write_bytes(b"\x00" * 100)
+
+        size, count = StorageScanner._dir_size_recursive(str(tmp_path), max_depth=2)
+        assert size == 500   # 5 arquivos × 100 bytes, todos os níveis
+        assert count == 5
 
     def test_handles_permission_error_on_subdir(self, tmp_path: Path):
         (tmp_path / "ok.txt").write_bytes(b"\x00" * 100)
@@ -602,3 +699,30 @@ class TestTopLargestDirsEdgeCases:
 
         assert len(results) == 1
         assert "valid_dir" in results[0].path
+
+
+class TestMediaTypeDetectionFallback:
+    """
+    Regressão 6.3: o script PowerShell de detecção de tipo de mídia NÃO deve
+    classificar silenciosamente bus/mídia desconhecidos como 'SSD'. O fallback
+    correto é 'Desconhecido' (honesto, e bate com o default de PartitionInfo).
+    """
+
+    def test_unknown_bus_fallback_is_desconhecido_not_ssd(self):
+        # O branch 'else' final (bus/mídia desconhecidos) atribui 'Desconhecido'.
+        assert "$result[$letter] = 'Desconhecido'" in _MEDIA_TYPE_PS_SCRIPT
+
+    def test_no_silent_ssd_default(self):
+        # 'SSD' só pode ser atribuído via o teste explícito de MediaType — uma
+        # única atribuição. Se alguém reintroduzir o fallback silencioso 'SSD',
+        # haverá 2 atribuições e este teste falha.
+        assert _MEDIA_TYPE_PS_SCRIPT.count("$result[$letter] = 'SSD'") == 1
+
+    def test_legitimate_media_branches_preserved(self):
+        # As classificações reais continuam presentes.
+        for assignment in (
+            "$result[$letter] = 'NVMe'",
+            "$result[$letter] = 'SSD'",
+            "$result[$letter] = 'HDD'",
+        ):
+            assert assignment in _MEDIA_TYPE_PS_SCRIPT

@@ -15,9 +15,12 @@ import pytest
 
 PySide6 = pytest.importorskip("PySide6")
 
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtCore import QCoreApplication  # noqa: E402  (após importorskip)
 
-from src.gui.workers import FullScanWorker
+from src.gui.workers import FullScanWorker  # noqa: E402  (após importorskip)
+from src.core.scanner import FileEntry  # noqa: E402
+from src.core.storage_db import StorageManagerDB  # noqa: E402
+from src.core.hash_cache import InMemoryHashCache  # noqa: E402
 
 
 # Sprint 7.3.1: usamos duck-typing em vez de isinstance(sig, pyqtBoundSignal)
@@ -63,6 +66,20 @@ class TestFullScanWorkerSignals:
         assert hasattr(worker, "progress_percent")
         assert hasattr(worker, "finished_result")
 
+    def test_partial_result_exists(self, qapp):
+        """Resultado preliminar emitido após a Etapa 2 (varredura não-bloqueante)."""
+        worker = FullScanWorker()
+        assert hasattr(worker, "partial_result")
+        assert _is_signal_like(worker.partial_result)
+
+    def test_partial_result_carries_object(self, qapp):
+        worker = FullScanWorker()
+        received = []
+        worker.partial_result.connect(received.append)
+        sentinel = object()
+        worker.partial_result.emit(sentinel)
+        assert received == [sentinel]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sprint 7.1 — sinais do painel de status
@@ -88,7 +105,7 @@ class TestScanStatusSignals:
         worker = FullScanWorker()
         received: list[tuple[str, str, str]] = []
         worker.disk_state_changed.connect(
-            lambda l, s, t: received.append((l, s, t))
+            lambda letter, state, text: received.append((letter, state, text))
         )
         worker.disk_state_changed.emit("C:", "scanning", "Analisando…")
         worker.disk_state_changed.emit("D:", "done", "")
@@ -114,3 +131,51 @@ class TestScanStatusSignals:
         worker.global_stage_changed.emit("")
         QCoreApplication.processEvents()
         assert received == ["Mapeando particoes...", ""]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Persistência antecipada do file_index (varredura não-bloqueante)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPersistFileIndex:
+    def test_persists_files_with_cached_hashes(self, qapp, tmp_path):
+        db = StorageManagerDB(tmp_path / "idx.db")
+        db.initialize()
+
+        files = [
+            FileEntry(path="G:\\a.iso", size_bytes=1000, category="Compactados",
+                      modified_time=111.0),
+            FileEntry(path="G:\\b.iso", size_bytes=1000, category="Compactados",
+                      modified_time=222.0),
+        ]
+        cache = InMemoryHashCache()
+        cache.put_full("G:\\a.iso", "HASH_A")  # só 'a' tem full-hash
+
+        FullScanWorker._persist_file_index(db, files, cache)
+
+        rows = {r["path"]: r for r in db.list_file_index(limit=100)}
+        assert set(rows) == {"G:\\a.iso", "G:\\b.iso"}
+        assert rows["G:\\a.iso"]["full_hash"] == "HASH_A"
+        assert rows["G:\\b.iso"]["full_hash"] is None
+        assert rows["G:\\a.iso"]["disk_letter"] == "G:"
+        db.close()
+
+    def test_repersist_enriches_hash_without_losing_row(self, qapp, tmp_path):
+        """Persistência antecipada (sem hash) seguida da final (com hash)."""
+        db = StorageManagerDB(tmp_path / "idx.db")
+        db.initialize()
+        files = [FileEntry(path="G:\\a.iso", size_bytes=1000,
+                           category="Compactados", modified_time=111.0)]
+
+        empty_cache = InMemoryHashCache()
+        FullScanWorker._persist_file_index(db, files, empty_cache)  # cedo: sem hash
+        assert db.list_file_index(limit=10)[0]["full_hash"] is None
+
+        full_cache = InMemoryHashCache()
+        full_cache.put_full("G:\\a.iso", "COMPUTED")
+        FullScanWorker._persist_file_index(db, files, full_cache)  # final: com hash
+
+        rows = db.list_file_index(limit=10)
+        assert len(rows) == 1
+        assert rows[0]["full_hash"] == "COMPUTED"
+        db.close()

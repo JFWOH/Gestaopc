@@ -22,12 +22,22 @@ dependencies = [
     "pydantic>=2.0,<3.0",
 ]
 
+# RECON 7.2 — entry point oficial. `gui-scripts` no Windows gera um .exe sem
+# janela de console (app GUI). Fonte única: src/main.py:main.
+[project.gui-scripts]
+gestaopc = "src.main:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0,<10.0",
     "pytest-cov>=4.0,<8.0",
     "ruff>=0.4,<1.0",
     "mypy>=1.0,<2.0",
+]
+# RECON 7.2 — empacotamento. PyInstaller --onedir mantém as DLLs do Qt soltas
+# (exigência LGPL do THIRD_PARTY_NOTICES). Só usado no build de release.
+packaging = [
+    "pyinstaller>=6.0,<7.0",
 ]
 
 [tool.ruff]
@@ -36,6 +46,13 @@ target-version = "py311"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# RECON 8.3.5 — segmentação de testes para feedback rápido (`pytest -m unit`).
+# Cada arquivo de teste declara `pytestmark = pytest.mark.unit|integration` no
+# topo do módulo. Marker não registrado emite PytestUnknownMarkWarning.
+markers = [
+    "unit: testes puros (mocks/tmp_path, sem I/O pesado, subprocess ou Qt widgets)",
+    "integration: real I/O, SQLite em disco, Qt widgets, threads, hashing SHA-256",
+]
 
 # ─────────────────────────────────────────────────────────────────────────
 # mypy — Sprint 7.6
@@ -74,6 +91,7 @@ module = [
     "src.core.hash_cache",
     "src.core.telemetry",
     "src.core.skills_loader",
+    "src.core.ai_backend",
 ]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true

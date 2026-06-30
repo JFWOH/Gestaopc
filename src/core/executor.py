@@ -17,7 +17,7 @@ import logging
 import os
 import shutil
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -31,6 +31,7 @@ try:
 except ImportError:  # ambiente headless (MCP server, CLI, etc.)
     _HAS_PYSIDE6 = False
 
+from src.core.config import EXECUTOR_MAX_BATCH_SIZE
 from src.core.storage_db import StorageManagerDB
 from src.core.path_guard import validate_path
 
@@ -40,8 +41,6 @@ logger = logging.getLogger(__name__)
 # Protege contra loops infinitos ou ações acidentais em grande escala.
 # Sprint 7.6: valor canônico em src/core/config.py; alias mantido para
 # compatibilidade com tests que checam `from src.core.executor import MAX_BATCH_SIZE`.
-from src.core.config import EXECUTOR_MAX_BATCH_SIZE
-
 MAX_BATCH_SIZE: int = EXECUTOR_MAX_BATCH_SIZE
 
 # Tentar importar send2trash para deleção segura (Lixeira).
@@ -224,15 +223,24 @@ class SafeFileExecutor:
                 self.history.append(record)
                 return record
 
-            if _HAS_SEND2TRASH and not permanent:
+            if permanent:
+                os.remove(filepath)
+                record.success = True
+                logger.info("Arquivo deletado permanentemente: %s", filepath)
+            elif _HAS_SEND2TRASH:
                 _send2trash(filepath)
                 record.used_trash = True
                 record.success = True
                 logger.info("Arquivo enviado à Lixeira: %s", filepath)
             else:
-                os.remove(filepath)
-                record.success = True
-                logger.info("Arquivo deletado permanentemente: %s", filepath)
+                # Hardening S10: usuário pediu Lixeira (reversível) mas send2trash
+                # está ausente — recusar em vez de deletar PERMANENTEMENTE sem
+                # querer. Para deleção definitiva, usar permanent=True explícito.
+                record.error = (
+                    "send2trash indisponível — deleção recusada para evitar "
+                    "perda permanente. Use permanent=True para deletar de vez."
+                )
+                logger.warning("Delete recusado (send2trash ausente): %s", filepath)
 
         except PermissionError as exc:
             record.error = f"Sem permissão (possível bloqueio de antivírus): {exc}"

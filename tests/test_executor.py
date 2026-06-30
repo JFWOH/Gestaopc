@@ -12,10 +12,8 @@ Cobre:
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
-import pytest
 
 from src.core.executor import (
     SafeFileExecutor,
@@ -349,7 +347,7 @@ class TestBatchSizeCap:
 
     def test_worker_constructor_stores_actions(self, tmp_path: Path):
         """FileActionWorker armazena as ações corretamente."""
-        from src.core.executor import FileActionWorker, MAX_BATCH_SIZE
+        from src.core.executor import FileActionWorker
         actions = [
             FileAction(action="DELETAR", source_path=str(tmp_path / f"f{i}.txt"))
             for i in range(3)
@@ -366,7 +364,6 @@ class TestBatchSizeCap:
         Abordagem: instanciar o worker e chamar run() diretamente em mock.
         """
         from src.core.executor import FileActionWorker, MAX_BATCH_SIZE
-        import time as _time
 
         n = MAX_BATCH_SIZE + 1
         actions = [

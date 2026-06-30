@@ -32,6 +32,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from src.core.config import HASH_FULL_CHUNK_SIZE, HASH_SAMPLE_SIZE
 from src.core.scanner import FileEntry, PartitionInfo
 
 logger = logging.getLogger(__name__)
@@ -41,23 +42,29 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # Tamanho da amostra para hash parcial (1 MB).
-from src.core.config import HASH_FULL_CHUNK_SIZE, HASH_SAMPLE_SIZE
-
 # Sprint 7.6: alias backward-compat para testes que fazem patch deste nome.
 # O valor canônico vive em src/core/config.py.
 _SAMPLE_SIZE: int = HASH_SAMPLE_SIZE
 
 # Extensões de mídia pesada que devem sair do NVMe (Regra 1).
+# Sprint 6.4: incluídos áudio (.flac/.wav grandes) e modelos de IA
+# (.gguf/.safetensors/.bin), que costumam ultrapassar 1 GB no NVMe.
 _HEAVY_MEDIA_EXTENSIONS: set[str] = {
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
     ".iso",
+    ".mp3", ".flac", ".wav", ".aac", ".ogg", ".m4a",
+    ".gguf", ".safetensors", ".bin",
 }
 
 # Limiar de 1 GB em bytes (Regra 1).
 _1GB: int = 1024 ** 3
 
 # Categorias que contam como "mídia" para Regra 3.
-_MEDIA_CATEGORIES: set[str] = {"Vídeos", "Imagens", "Compactados"}
+# Sprint 6.4: "Áudio" e "Modelos IA" passam a ser candidatos a realocação
+# quando o disco de origem está crítico (>90%).
+_MEDIA_CATEGORIES: set[str] = {
+    "Vídeos", "Imagens", "Compactados", "Áudio", "Modelos IA",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -370,22 +377,27 @@ class SmartRulesEngine:
             and file.size_bytes > _1GB
             and Path(file.path).suffix.lower() in _HEAVY_MEDIA_EXTENSIONS
         ):
-            target = self._best_sata_target(partition_map)
-            suggestions.append(
-                ReallocationSuggestion(
-                    rule_id=1,
-                    rule_name="Mídia pesada no NVMe",
-                    file_path=file.path,
-                    action="MOVER",
-                    detail=(
-                        f"Mover {file.size_mb:.0f} MB de mídia "
-                        f"de {file_drive} (NVMe) para {target} (SATA) "
-                        f"para liberar espaço no disco principal."
-                    ),
-                    target_disk=target,
-                    priority="ALTA",
-                )
+            target = self._best_sata_target(
+                partition_map, file.size_bytes, file_drive
             )
+            # Só sugerir se há um destino válido (existe, ≠ origem, comporta o
+            # arquivo). Sem destino → nenhuma sugestão (Seção 6.2).
+            if target is not None:
+                suggestions.append(
+                    ReallocationSuggestion(
+                        rule_id=1,
+                        rule_name="Mídia pesada no NVMe",
+                        file_path=file.path,
+                        action="MOVER",
+                        detail=(
+                            f"Mover {file.size_mb:.0f} MB de mídia "
+                            f"de {file_drive} (NVMe) para {target} (SATA) "
+                            f"para liberar espaço no disco principal."
+                        ),
+                        target_disk=target,
+                        priority="ALTA",
+                    )
+                )
 
         # ── Regra 2: Arquivo duplicado → deletar cópia ─────────────────
         if duplicate_groups:
@@ -419,22 +431,26 @@ class SmartRulesEngine:
                 part.percent_used > 90.0
                 and file.category in _MEDIA_CATEGORIES
             ):
-                target = self._best_external_target(partition_map)
-                suggestions.append(
-                    ReallocationSuggestion(
-                        rule_id=3,
-                        rule_name="Disco crítico (>90% uso)",
-                        file_path=file.path,
-                        action="MOVER",
-                        detail=(
-                            f"Disco {file_drive} está {part.percent_used}% cheio. "
-                            f"Mover {file.size_mb:.0f} MB de {file.category} "
-                            f"para disco externo {target}."
-                        ),
-                        target_disk=target,
-                        priority="ALTA",
-                    )
+                target = self._best_external_target(
+                    partition_map, file.size_bytes, file_drive
                 )
+                # Só sugerir se há um destino externo válido (Seção 6.2).
+                if target is not None:
+                    suggestions.append(
+                        ReallocationSuggestion(
+                            rule_id=3,
+                            rule_name="Disco crítico (>90% uso)",
+                            file_path=file.path,
+                            action="MOVER",
+                            detail=(
+                                f"Disco {file_drive} está {part.percent_used}% cheio. "
+                                f"Mover {file.size_mb:.0f} MB de {file.category} "
+                                f"para disco externo {target}."
+                            ),
+                            target_disk=target,
+                            priority="ALTA",
+                        )
+                    )
 
         return suggestions
 
@@ -459,23 +475,66 @@ class SmartRulesEngine:
         """Extrai a letra do drive de um caminho (ex: 'C:\\foo' → 'C:')."""
         return Path(filepath).drive.upper()
 
-    def _best_sata_target(self, partition_map: dict[str, PartitionInfo]) -> str:
-        """Retorna o disco SATA interno com mais espaço livre."""
-        best = "D:"
-        best_free = 0
-        for letter in self.sata_internal_letters:
-            if letter in partition_map and partition_map[letter].free_bytes > best_free:
-                best_free = partition_map[letter].free_bytes
-                best = letter
-        return best
+    def _best_sata_target(
+        self,
+        partition_map: dict[str, PartitionInfo],
+        required_bytes: int,
+        source_drive: str,
+    ) -> str | None:
+        """
+        Retorna o disco SATA interno candidato a destino, ou ``None``.
 
-    def _best_external_target(self, partition_map: dict[str, PartitionInfo]) -> str:
-        """Retorna o disco externo com mais espaço livre."""
-        best = "J:"
+        Um candidato válido (Seção 6.2 — roteamento seguro):
+          - existe no ``partition_map`` (sem default fabricado);
+          - é diferente do disco de origem (origem ≠ destino);
+          - tem espaço livre suficiente (``free_bytes >= required_bytes``).
+
+        Entre os válidos, escolhe o de maior espaço livre. Retorna ``None``
+        quando nenhum candidato satisfaz as três condições.
+        """
+        return self._best_target(
+            self.sata_internal_letters, partition_map, required_bytes, source_drive
+        )
+
+    def _best_external_target(
+        self,
+        partition_map: dict[str, PartitionInfo],
+        required_bytes: int,
+        source_drive: str,
+    ) -> str | None:
+        """
+        Retorna o disco externo candidato a destino, ou ``None``.
+
+        Aplica as mesmas três validações de :meth:`_best_sata_target`
+        (existe, origem ≠ destino, espaço suficiente).
+        """
+        return self._best_target(
+            self.external_letters, partition_map, required_bytes, source_drive
+        )
+
+    @staticmethod
+    def _best_target(
+        candidate_letters: set[str],
+        partition_map: dict[str, PartitionInfo],
+        required_bytes: int,
+        source_drive: str,
+    ) -> str | None:
+        """
+        Helper comum: melhor destino entre ``candidate_letters`` que exista,
+        difira da origem e comporte o arquivo. ``None`` se não houver.
+        """
+        best: str | None = None
         best_free = 0
-        for letter in self.external_letters:
-            if letter in partition_map and partition_map[letter].free_bytes > best_free:
-                best_free = partition_map[letter].free_bytes
+        for letter in candidate_letters:
+            if letter == source_drive:
+                continue
+            part = partition_map.get(letter)
+            if part is None:
+                continue
+            if part.free_bytes < required_bytes:
+                continue
+            if part.free_bytes > best_free:
+                best_free = part.free_bytes
                 best = letter
         return best
 
@@ -520,7 +579,9 @@ if __name__ == "__main__":
     import sys
 
     # Forcar UTF-8 no stdout do Windows para evitar UnicodeEncodeError.
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    # hasattr: reconfigure() existe em TextIOWrapper, não em stdout redirecionado.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     logging.basicConfig(
         level=logging.INFO,
@@ -631,7 +692,7 @@ if __name__ == "__main__":
         for s in suggestions:
             print(f"    [*] {s}")
 
-        print(f"\n  >> Avaliando: fotos_viagem.zip (500 MB no C: com 94% uso)")
+        print("\n  >> Avaliando: fotos_viagem.zip (500 MB no C: com 94% uso)")
         suggestions = engine.evaluate(media_on_full_disk, fake_partitions, groups)
         for s in suggestions:
             print(f"    [*] {s}")

@@ -7,7 +7,7 @@ com menu de contexto para acesso rápido.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtCore import Qt
 from PySide6.QtGui import (
     QColor,
     QFont,

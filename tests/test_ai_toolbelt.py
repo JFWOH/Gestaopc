@@ -30,12 +30,14 @@ from src.core.storage_db import StorageManagerDB
 
 @pytest.fixture(autouse=True)
 def reset_globals():
-    """Garante estado limpo de rate limiter e token store entre cada teste."""
+    """Garante estado limpo de rate limiter, token store e approval hook."""
     tb._reset_rate_limiter()
     tb._reset_token_store()
+    tb.set_approval_hook(None)  # S5: rede de segurança contra hook vazado da GUI
     yield
     tb._reset_rate_limiter()
     tb._reset_token_store()
+    tb.set_approval_hook(None)
 
 
 @pytest.fixture()
@@ -47,9 +49,9 @@ def tmp_db(tmp_path, monkeypatch):
         return db_path
 
     monkeypatch.setattr(tb, "get_default_db_path", _fake_db_path)
-    # Inicializar schema
-    with StorageManagerDB(db_path) as db:
-        pass  # __enter__ chama initialize()
+    # Inicializar schema (o context manager chama initialize() no __enter__)
+    with StorageManagerDB(db_path):
+        pass
     return db_path
 
 
@@ -119,6 +121,87 @@ class TestRateLimiter:
         # Agora deve permitir nova execução
         assert tb._check_rate_limit() is None
 
+    def test_reserve_slot_records_atomically(self):
+        """S8: _reserve_exec_slot conta o slot já na reserva."""
+        for _ in range(tb._MAX_EXEC_PER_MINUTE):
+            assert tb._reserve_exec_slot() is None
+        # Esgotado — a próxima reserva é negada.
+        result = tb._reserve_exec_slot()
+        assert result is not None
+        assert result["error"] == "RATE_LIMIT_EXCEEDED"
+
+    def test_reserve_slot_concurrent_respects_limit(self):
+        """S8: sob concorrência, no máx _MAX_EXEC_PER_MINUTE reservas passam."""
+        import threading
+
+        results: list = []
+        lock = threading.Lock()
+
+        def worker():
+            r = tb._reserve_exec_slot()
+            with lock:
+                results.append(r)
+
+        threads = [threading.Thread(target=worker) for _ in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        granted = [r for r in results if r is None]
+        assert len(granted) == tb._MAX_EXEC_PER_MINUTE, (
+            f"esperava {tb._MAX_EXEC_PER_MINUTE} reservas, obteve {len(granted)}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Aprovação humana fora da banda (S5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestApprovalHook:
+    def test_no_hook_proceeds(self):
+        """Sem hook instalado: comportamento token-only (back-compat)."""
+        assert tb._require_approval("move_to_trash", {"path": "D:/x"}) is None
+
+    def test_hook_denial_blocks_executive_action(self, tmp_path, tmp_db):
+        victim = tmp_path / "f.txt"
+        victim.write_text("x")
+        tb.set_approval_hook(lambda info: False)  # usuário NEGA
+        tok = tb.request_confirmation("move_to_trash", {"path": str(victim)})
+        result = tb.move_to_trash(str(victim), tok["token"])
+        assert result["error"] == "APPROVAL_DENIED"
+        assert victim.exists(), "arquivo não pode ter sido tocado"
+
+    def test_hook_approval_allows_action(self, tmp_path, tmp_db):
+        victim = tmp_path / "f.txt"
+        victim.write_text("x")
+        received = {}
+
+        def approve(info):
+            received.update(info)
+            return True
+
+        tb.set_approval_hook(approve)
+        tok = tb.request_confirmation("move_to_trash", {"path": str(victim)})
+        with patch.dict("sys.modules", {"send2trash": MagicMock(
+            send2trash=lambda p: Path(p).unlink(missing_ok=True)
+        )}):
+            result = tb.move_to_trash(str(victim), tok["token"])
+        assert result.get("success") is True
+        # O hook recebeu metadados úteis para o diálogo.
+        assert received["action"] == "move_to_trash"
+        assert "description" in received and "risk_level" in received
+
+    def test_hook_exception_denies(self, tmp_path, tmp_db):
+        """Hook que lança exceção → nega por segurança (fail-closed)."""
+        victim = tmp_path / "f.txt"
+        victim.write_text("x")
+        tb.set_approval_hook(lambda info: (_ for _ in ()).throw(RuntimeError("boom")))
+        tok = tb.request_confirmation("move_to_trash", {"path": str(victim)})
+        result = tb.move_to_trash(str(victim), tok["token"])
+        assert result["error"] == "APPROVAL_DENIED"
+        assert victim.exists()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Token store
@@ -140,11 +223,36 @@ class TestTokenStore:
         tok = tb.request_confirmation("move_to_trash", {"path": "D:/x.mp4"})
         token = tok["token"]
         # Primeiro uso: válido
-        assert tb._validate_token(token, "move_to_trash") is None
+        assert tb._validate_token(token, "move_to_trash", {"path": "D:/x.mp4"}) is None
         # Segundo uso: inválido (token consumido)
-        err = tb._validate_token(token, "move_to_trash")
+        err = tb._validate_token(token, "move_to_trash", {"path": "D:/x.mp4"})
         assert err is not None
         assert err["error"] == "INVALID_TOKEN"
+
+    def test_token_one_shot_under_concurrency(self):
+        """S8: sob concorrência, exatamente UMA validação do mesmo token vence."""
+        import threading
+
+        tok = tb.request_confirmation("move_to_trash", {"path": "D:/y.mp4"})
+        token = tok["token"]
+        results: list = []
+        lock = threading.Lock()
+
+        def worker():
+            r = tb._validate_token(token, "move_to_trash", {"path": "D:/y.mp4"})
+            with lock:
+                results.append(r)
+
+        threads = [threading.Thread(target=worker) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        succeeded = [r for r in results if r is None]
+        assert len(succeeded) == 1, (
+            f"token one-shot deveria vencer 1x, venceu {len(succeeded)}x"
+        )
 
     def test_wrong_action_returns_mismatch(self):
         tok = tb.request_confirmation("move_file", {})
@@ -447,7 +555,6 @@ class TestMoveToTrash:
             mock_trash.side_effect = fake_trash
 
             # Importar send2trash diretamente no escopo do módulo
-            import src.core.ai_toolbelt as mod
             with patch.dict("sys.modules", {"send2trash": MagicMock(send2trash=fake_trash)}):
                 result = tb.move_to_trash(str(victim), tok["token"])
 
@@ -468,6 +575,19 @@ class TestMoveToTrash:
 
         # Aceita success ou qualquer resultado não-exceção
         assert "error" in result or result.get("success") is True
+
+    def test_refuses_when_send2trash_unavailable(self, tmp_path, tmp_db):
+        """Hardening S10: sem send2trash, recusa em vez de deletar permanente."""
+        victim = tmp_path / "precioso.txt"
+        victim.write_text("nao me delete")
+
+        tok = tb.request_confirmation("move_to_trash", {"path": str(victim)})
+        # Simular ausência da biblioteca: import de send2trash levanta ImportError.
+        with patch.dict("sys.modules", {"send2trash": None}):
+            result = tb.move_to_trash(str(victim), tok["token"])
+
+        assert result["error"] == "TRASH_UNAVAILABLE"
+        assert victim.exists(), "arquivo NÃO pode ter sido deletado"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

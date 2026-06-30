@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
+    QMessageBox,
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QLineEdit,
     QPushButton, QComboBox, QLabel, QFrame
 )
@@ -37,6 +39,7 @@ from src.core.config import (
     WORKER_QUIT_TIMEOUT_MS,
     WORKER_RESTART_TIMEOUT_MS,
 )
+from src.core.ai_backend import AIBackend
 from src.core.ollama_client import OllamaClient
 from src.core.skills_loader import Skill, load_skills
 from src.core.storage_db import StorageManagerDB, get_default_db_path
@@ -49,19 +52,38 @@ logger = logging.getLogger(__name__)
 # Executor de tools (bridge ai_toolbelt → Ollama agent)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Hardening S6: whitelist de nomes de tool derivada dos schemas públicos. O
+# nome vem do LLM; sem esta checagem, getattr(tb, name) permitiria invocar
+# qualquer atributo do módulo — inclusive helpers como _reset_rate_limiter /
+# _reset_token_store, que desligariam os próprios controles de segurança.
+_ALLOWED_TOOL_NAMES: frozenset[str] = frozenset(
+    schema["function"]["name"] for schema in tb.get_tool_schemas()
+)
+
+
 def _execute_tool(name: str, args: dict) -> object:
     """
-    Executa uma tool do ai_toolbelt por nome.
+    Executa uma tool do ai_toolbelt por nome, validando contra a whitelist.
 
-    Ações executivas passam ai_source='ai:ollama' automaticamente (é o default
-    em todas as funções executivas do toolbelt).
+    Hardening:
+      • S6 — só nomes em _ALLOWED_TOOL_NAMES são chamados (bloqueia getattr
+        arbitrário e helpers internos com prefixo '_').
+      • S9 — ``ai_source`` vindo do modelo é descartado; as ações executivas
+        usam seu default 'ai:ollama', impedindo o LLM de forjar a trilha de
+        auditoria (ex.: passar ai_source='ui' para se disfarçar de usuário).
     """
-    fn = getattr(tb, name, None)
-    if fn is None:
+    if name not in _ALLOWED_TOOL_NAMES:
+        logger.warning("Tool não permitida bloqueada: %r", name)
         return {
-            "error": "TOOL_NOT_FOUND",
-            "message": f"Tool '{name}' não encontrada no ai_toolbelt.",
+            "error": "TOOL_NOT_ALLOWED",
+            "message": f"Tool '{name}' não é uma ferramenta permitida.",
         }
+
+    # S9 — nunca confiar no ai_source vindo do modelo.
+    if isinstance(args, dict) and "ai_source" in args:
+        args = {k: v for k, v in args.items() if k != "ai_source"}
+
+    fn = getattr(tb, name)
     try:
         return fn(**args)
     except TypeError as exc:
@@ -108,12 +130,15 @@ class OllamaAgentWorker(QThread):
         messages: list[dict],
         tools: list[dict],
         parent=None,
+        backend: AIBackend | None = None,
     ):
         super().__init__(parent)
         self.model = model
         self.messages = messages
         self.tools = tools
-        self._client = OllamaClient()
+        # RECON 8.4 — backend injetável (default Ollama). O AssistantTab passa
+        # seu próprio backend; default preserva instanciações existentes/testes.
+        self._client: AIBackend = backend if backend is not None else OllamaClient()
 
     def run(self):
         for event in self._client.chat_with_tools(
@@ -160,6 +185,11 @@ class AssistantTab(QWidget):
     # Permite que a MainWindow atualize a aba Histórico automaticamente.
     ai_action_executed = Signal()
 
+    # Hardening S5: emitido pelo thread do worker para pedir aprovação humana de
+    # uma ação executiva. Entregue (QueuedConnection) ao thread da UI, que mostra
+    # o diálogo modal. O worker bloqueia até a resposta via threading.Event.
+    approval_requested = Signal(dict)
+
     # Tools que modificam o sistema de arquivos ou o banco de dados
     # (deve espelhar EXECUTIVE_ACTIONS em ai_toolbelt.py)
     _EXECUTIVE_TOOLS = frozenset({
@@ -185,10 +215,14 @@ class AssistantTab(QWidget):
     _WORKER_QUIT_TIMEOUT_MS: int = WORKER_QUIT_TIMEOUT_MS
     _WORKER_CLEANUP_TIMEOUT_MS: int = WORKER_CLEANUP_TIMEOUT_MS
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, backend: AIBackend | None = None):
         super().__init__(parent)
-        self._client = OllamaClient()
-        self._db = StorageManagerDB(get_default_db_path())
+        # RECON 8.4 — backend de IA injetável (default Ollama). Propagado ao
+        # OllamaAgentWorker, permitindo trocar Ollama por outro backend sem
+        # alterar esta GUI.
+        self._client: AIBackend = backend if backend is not None else OllamaClient()
+        # Optional: definido como None no closeEvent (cleanup do SQLite).
+        self._db: StorageManagerDB | None = StorageManagerDB(get_default_db_path())
         self._db.initialize()
 
         # Histórico de mensagens do chat (formato Ollama)
@@ -200,8 +234,55 @@ class AssistantTab(QWidget):
         self._skills: list[Skill] = load_skills()
         self._selected_skill: Skill | None = None
 
+        # Hardening S5: gate de aprovação humana para ações executivas da IA.
+        # O hook (chamado no thread do worker) bloqueia até o usuário decidir
+        # num diálogo modal mostrado pelo thread da UI.
+        self._approval_event: threading.Event | None = None
+        self._approval_result: bool = False
+        self.approval_requested.connect(self._on_approval_requested)
+        tb.set_approval_hook(self._human_approval_hook)
+
         self._build_ui()
         self._refresh_models()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Hardening S5 — aprovação humana fora da banda da IA
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Tempo máximo (s) que o worker espera a decisão humana antes de negar.
+    _APPROVAL_TIMEOUT_SECONDS: float = 120.0
+
+    def _human_approval_hook(self, info: dict) -> bool:
+        """
+        Chamado no thread do worker (via ai_toolbelt). Emite o pedido para o
+        thread da UI e bloqueia até a resposta (ou timeout → nega).
+        """
+        ev = threading.Event()
+        self._approval_event = ev
+        self._approval_result = False
+        self.approval_requested.emit(info)  # QueuedConnection → thread da UI
+        if not ev.wait(timeout=self._APPROVAL_TIMEOUT_SECONDS):
+            logger.warning("Aprovação humana expirou — ação negada.")
+            return False
+        return self._approval_result
+
+    def _on_approval_requested(self, info: dict) -> None:
+        """Thread da UI: mostra o diálogo modal e registra a decisão."""
+        try:
+            desc = info.get("description") or info.get("action", "ação")
+            risk = info.get("risk_level", "?")
+            reply = QMessageBox.question(
+                self,
+                "Confirmar ação da IA",
+                f"O assistente quer executar:\n\n{desc}\n\n"
+                f"Nível de risco: {risk}\n\nAutorizar esta ação?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            self._approval_result = reply == QMessageBox.StandardButton.Yes
+        finally:
+            if self._approval_event is not None:
+                self._approval_event.set()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Sprint 7.5 — Resource lifecycle (S-6, Q-3)
@@ -210,10 +291,22 @@ class AssistantTab(QWidget):
     def closeEvent(self, event: QCloseEvent) -> None:
         """
         Cleanup ao destruir o widget:
+          - Remove o hook de aprovação global (S5) e desbloqueia o worker
           - Para o worker em andamento (quit + wait com timeout)
           - Fecha a conexão com o DB
           - Não vaza thread em sessão longa nem deixa FD do SQLite aberto
         """
+        # S5: remover o hook ANTES de destruir o widget (o hook chama métodos
+        # deste objeto). Desbloquear qualquer aprovação pendente (nega) para o
+        # worker não ficar preso em ev.wait durante o shutdown.
+        try:
+            tb.set_approval_hook(None)
+        except Exception:
+            logger.debug("Erro ao remover approval hook", exc_info=True)
+        if self._approval_event is not None:
+            self._approval_result = False
+            self._approval_event.set()
+
         self._stop_active_worker(timeout_ms=self._WORKER_QUIT_TIMEOUT_MS)
         try:
             if hasattr(self, "_db") and self._db is not None:
@@ -600,7 +693,9 @@ class AssistantTab(QWidget):
         # mas se o usuário spam-clicar antes da resposta, evita acúmulo de threads.
         self._stop_active_worker(timeout_ms=WORKER_RESTART_TIMEOUT_MS)
 
-        self._worker = OllamaAgentWorker(model, self._messages, tools, self)
+        self._worker = OllamaAgentWorker(
+            model, self._messages, tools, self, backend=self._client
+        )
         self._worker.tool_call_started.connect(self._on_tool_call_started)
         self._worker.tool_call_finished.connect(self._on_tool_call_finished)
         self._worker.text_received.connect(self._on_agent_text)
