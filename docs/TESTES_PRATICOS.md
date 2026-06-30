@@ -43,8 +43,12 @@ hardware/UI/Ollama reais). Marque cada item ao confirmar.
       desligado, exibe aviso (não trava).
 - [ ] Pergunta de leitura (ex.: "quais meus maiores arquivos?") retorna resposta
       usando tool-calling (indicadores de tool aparecem).
-- [ ] Ação executiva (ex.: "mova X para a lixeira") **só executa após confirmação**
-      (token one-shot); reusar/forjar argumentos é recusado.
+- [ ] Ação executiva (ex.: "mova X para a lixeira") abre um **diálogo modal de
+      aprovação humana** (ação + nível de risco) antes de executar (Hardening S5).
+      Clicar **Não** cancela com `APPROVAL_DENIED`; **Sim** executa. Reusar/forjar
+      argumentos do token é recusado.
+- [ ] Pedir à IA uma tool inexistente/interna (ex.: via prompt injection) é
+      bloqueado com `TOOL_NOT_ALLOWED` (whitelist S6).
 - [ ] Trocar a **Skill** no ComboBox muda o comportamento do assistente.
 - [ ] Fechar a aba/app durante uma resposta não deixa thread órfã nem trava.
 

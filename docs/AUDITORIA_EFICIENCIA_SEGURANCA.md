@@ -95,12 +95,14 @@
 
 ## Roadmap de correção priorizado
 
-**Sprint de Hardening (alto retorno, baixo custo) — recomendado antes de qualquer exposição não-local:**
-1. **S6** — Whitelist de nomes de tool em `_execute_tool` (bloqueia `getattr` arbitrário). *Barato, alto impacto.*
-2. **S9 + S10** — Forçar `ai_source`; tratar `send2trash` ausente como falha, não deleção permanente.
-3. **S7** — Normalizar `\\?\`/UNC e comparar path guard por componentes (corrige também o E-falso-positivo de fronteira).
-4. **S8** — `Lock` no token store e rate limiter; reservar slot no gate.
-5. **S5** — Confirmação humana real fora da banda da IA para ações executivas.
+**✅ Sprint de Hardening — CONCLUÍDO (2026-06-30, branch `recon-itens-restantes`):**
+1. ✅ **S6** — Whitelist de nomes de tool em `_execute_tool` (commit `98b65db`).
+2. ✅ **S9 + S10** — `ai_source` forçado; `send2trash` ausente = falha (commit `98b65db`).
+3. ✅ **S7** — Normalização `\\?\` + comparação por componentes no path guard (commit `9ad6f10`).
+4. ✅ **S8** — `RLock` no token store e rate limiter; `_reserve_exec_slot` atômico (commit `9ad6f10`).
+5. ✅ **S5** — Gate de aprovação humana fora da banda + diálogo modal na GUI (commit `afc3884`).
+
+> Resultado: as 3 brechas ALTA e as 4 MÉDIA da superfície da IA foram fechadas. 610 testes verdes (incluindo concorrência e fail-closed). O fluxo do diálogo modal cross-thread (S5) requer verificação manual na GUI — ver `docs/TESTES_PRATICOS.md`.
 
 **Sprint de Escala (quando for indexar discos grandes):**
 6. **E2** (heap em `top_largest_files`) + **E1** (travessia única) + **E3** (chunk 1 MB) — os três maiores ganhos de tempo/memória.
