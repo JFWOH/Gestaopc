@@ -32,7 +32,8 @@ PySide6 = pytest.importorskip("PySide6")
 
 from PySide6.QtGui import QCloseEvent  # noqa: E402  (após importorskip)
 
-from src.gui.assistant_tab import AssistantTab  # noqa: E402  (após importorskip)
+from src.gui.assistant_tab import AssistantTab, _execute_tool  # noqa: E402
+import src.core.ai_toolbelt as tb  # noqa: E402
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -364,3 +365,51 @@ class TestSystemContextLogging:
         assert "[Sugestões" in ctx
         assert "[Duplicatas" in ctx
         assert "[Histórico" in ctx or "[Últimas" in ctx
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hardening S6/S9 — _execute_tool (superfície de tools da IA)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestExecuteToolHardening:
+    def test_rejects_internal_helper_name(self):
+        """S6: o LLM não pode chamar _reset_rate_limiter para desligar controles."""
+        out = _execute_tool("_reset_rate_limiter", {})
+        assert out["error"] == "TOOL_NOT_ALLOWED"
+
+    def test_rejects_reset_token_store(self):
+        out = _execute_tool("_reset_token_store", {})
+        assert out["error"] == "TOOL_NOT_ALLOWED"
+
+    def test_rejects_unknown_name(self):
+        out = _execute_tool("__import__", {})
+        assert out["error"] == "TOOL_NOT_ALLOWED"
+
+    def test_allows_legitimate_read_tool(self):
+        """Uma tool real da whitelist é chamada normalmente."""
+        sentinel = [{"letter": "C:"}]
+        with patch("src.gui.assistant_tab.tb.list_partitions",
+                   return_value=sentinel) as spy:
+            out = _execute_tool("list_partitions", {})
+        spy.assert_called_once()
+        assert out is sentinel
+
+    def test_strips_forged_ai_source(self):
+        """S9: ai_source vindo do modelo é descartado (não chega à função)."""
+        spy = MagicMock(return_value={"ok": True})
+        with patch("src.gui.assistant_tab.tb.move_to_trash", spy):
+            _execute_tool(
+                "move_to_trash",
+                {"path": "X:\\f.bin", "confirmation_token": "t", "ai_source": "ui"},
+            )
+        _, kwargs = spy.call_args
+        assert "ai_source" not in kwargs
+        assert kwargs["path"] == "X:\\f.bin"
+
+    def test_whitelist_matches_schemas(self):
+        """A whitelist deve refletir exatamente os nomes dos schemas públicos."""
+        from src.gui.assistant_tab import _ALLOWED_TOOL_NAMES
+        schema_names = {s["function"]["name"] for s in tb.get_tool_schemas()}
+        assert _ALLOWED_TOOL_NAMES == schema_names
+        assert "move_to_trash" in _ALLOWED_TOOL_NAMES
+        assert "_reset_rate_limiter" not in _ALLOWED_TOOL_NAMES

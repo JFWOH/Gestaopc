@@ -667,15 +667,23 @@ def move_to_trash(
     if not p.exists():
         return {"error": "FILE_NOT_FOUND", "message": f"Arquivo não encontrado: {path}"}
 
+    # Hardening S10: a tool é anunciada como "reversível" (vai para a Lixeira).
+    # Se send2trash não estiver disponível, RECUSAR — nunca cair para unlink()
+    # permanente silencioso, que contradiria a descrição usada pela IA para
+    # avaliar o risco e causaria perda de dados irreversível.
     try:
-        used_trash = False
-        try:
-            from send2trash import send2trash as _send2trash
-            _send2trash(str(p))
-            used_trash = True
-        except ImportError:
-            p.unlink()
+        from send2trash import send2trash as _send2trash
+    except ImportError:
+        return {
+            "error": "TRASH_UNAVAILABLE",
+            "message": (
+                "Biblioteca send2trash indisponível — operação recusada para "
+                "evitar deleção PERMANENTE (não reversível). Instale send2trash."
+            ),
+        }
 
+    try:
+        _send2trash(str(p))
         _record_exec()
         with _open_db() as db:
             op_id = db.insert_operation(
@@ -683,15 +691,15 @@ def move_to_trash(
                 action="DELETAR",
                 source_path=path,
                 success=True,
-                used_trash=used_trash,
+                used_trash=True,
                 source=ai_source,
             )
         return {
             "success": True,
             "path": path,
             "operation_id": op_id,
-            "used_trash": used_trash,
-            "message": "Arquivo enviado para Lixeira." if used_trash else "Arquivo deletado permanentemente.",
+            "used_trash": True,
+            "message": "Arquivo enviado para Lixeira.",
         }
     except PermissionError as exc:
         return {"error": "PERMISSION_DENIED", "message": f"Sem permissão (AV/bloqueio): {exc}"}
@@ -823,13 +831,18 @@ def apply_suggestion(
             return {"error": "FILE_NOT_FOUND", "message": f"Arquivo não encontrado: {file_path}"}
 
         if action == "DELETAR":
-            used_trash = False
+            # Hardening S10: recusar se send2trash indisponível (ver move_to_trash).
             try:
                 from send2trash import send2trash as _send2trash
-                _send2trash(str(p))
-                used_trash = True
             except ImportError:
-                p.unlink()
+                return {
+                    "error": "TRASH_UNAVAILABLE",
+                    "message": (
+                        "Biblioteca send2trash indisponível — operação recusada "
+                        "para evitar deleção PERMANENTE. Instale send2trash."
+                    ),
+                }
+            _send2trash(str(p))
 
             _record_exec()
             with _open_db() as db:
@@ -838,7 +851,7 @@ def apply_suggestion(
                     action="DELETAR",
                     source_path=file_path,
                     success=True,
-                    used_trash=used_trash,
+                    used_trash=True,
                     source=ai_source,
                 )
                 db.mark_suggestion_executed(suggestion_id)

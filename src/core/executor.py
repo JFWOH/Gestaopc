@@ -223,15 +223,24 @@ class SafeFileExecutor:
                 self.history.append(record)
                 return record
 
-            if _HAS_SEND2TRASH and not permanent:
+            if permanent:
+                os.remove(filepath)
+                record.success = True
+                logger.info("Arquivo deletado permanentemente: %s", filepath)
+            elif _HAS_SEND2TRASH:
                 _send2trash(filepath)
                 record.used_trash = True
                 record.success = True
                 logger.info("Arquivo enviado à Lixeira: %s", filepath)
             else:
-                os.remove(filepath)
-                record.success = True
-                logger.info("Arquivo deletado permanentemente: %s", filepath)
+                # Hardening S10: usuário pediu Lixeira (reversível) mas send2trash
+                # está ausente — recusar em vez de deletar PERMANENTEMENTE sem
+                # querer. Para deleção definitiva, usar permanent=True explícito.
+                record.error = (
+                    "send2trash indisponível — deleção recusada para evitar "
+                    "perda permanente. Use permanent=True para deletar de vez."
+                )
+                logger.warning("Delete recusado (send2trash ausente): %s", filepath)
 
         except PermissionError as exc:
             record.error = f"Sem permissão (possível bloqueio de antivírus): {exc}"

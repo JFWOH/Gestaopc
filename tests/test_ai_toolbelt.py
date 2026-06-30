@@ -468,6 +468,19 @@ class TestMoveToTrash:
         # Aceita success ou qualquer resultado não-exceção
         assert "error" in result or result.get("success") is True
 
+    def test_refuses_when_send2trash_unavailable(self, tmp_path, tmp_db):
+        """Hardening S10: sem send2trash, recusa em vez de deletar permanente."""
+        victim = tmp_path / "precioso.txt"
+        victim.write_text("nao me delete")
+
+        tok = tb.request_confirmation("move_to_trash", {"path": str(victim)})
+        # Simular ausência da biblioteca: import de send2trash levanta ImportError.
+        with patch.dict("sys.modules", {"send2trash": None}):
+            result = tb.move_to_trash(str(victim), tok["token"])
+
+        assert result["error"] == "TRASH_UNAVAILABLE"
+        assert victim.exists(), "arquivo NÃO pode ter sido deletado"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # move_file

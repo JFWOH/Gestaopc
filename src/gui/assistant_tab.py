@@ -50,19 +50,38 @@ logger = logging.getLogger(__name__)
 # Executor de tools (bridge ai_toolbelt → Ollama agent)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Hardening S6: whitelist de nomes de tool derivada dos schemas públicos. O
+# nome vem do LLM; sem esta checagem, getattr(tb, name) permitiria invocar
+# qualquer atributo do módulo — inclusive helpers como _reset_rate_limiter /
+# _reset_token_store, que desligariam os próprios controles de segurança.
+_ALLOWED_TOOL_NAMES: frozenset[str] = frozenset(
+    schema["function"]["name"] for schema in tb.get_tool_schemas()
+)
+
+
 def _execute_tool(name: str, args: dict) -> object:
     """
-    Executa uma tool do ai_toolbelt por nome.
+    Executa uma tool do ai_toolbelt por nome, validando contra a whitelist.
 
-    Ações executivas passam ai_source='ai:ollama' automaticamente (é o default
-    em todas as funções executivas do toolbelt).
+    Hardening:
+      • S6 — só nomes em _ALLOWED_TOOL_NAMES são chamados (bloqueia getattr
+        arbitrário e helpers internos com prefixo '_').
+      • S9 — ``ai_source`` vindo do modelo é descartado; as ações executivas
+        usam seu default 'ai:ollama', impedindo o LLM de forjar a trilha de
+        auditoria (ex.: passar ai_source='ui' para se disfarçar de usuário).
     """
-    fn = getattr(tb, name, None)
-    if fn is None:
+    if name not in _ALLOWED_TOOL_NAMES:
+        logger.warning("Tool não permitida bloqueada: %r", name)
         return {
-            "error": "TOOL_NOT_FOUND",
-            "message": f"Tool '{name}' não encontrada no ai_toolbelt.",
+            "error": "TOOL_NOT_ALLOWED",
+            "message": f"Tool '{name}' não é uma ferramenta permitida.",
         }
+
+    # S9 — nunca confiar no ai_source vindo do modelo.
+    if isinstance(args, dict) and "ai_source" in args:
+        args = {k: v for k, v in args.items() if k != "ai_source"}
+
+    fn = getattr(tb, name)
     try:
         return fn(**args)
     except TypeError as exc:
