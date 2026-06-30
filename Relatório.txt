@@ -148,13 +148,16 @@ undo_last_operation sem sufixo anti-sobrescrita. Ver docs/AUDITORIA_EFICIENCIA_S
 Pontos fortes: pipeline de duplicatas 3-etapas; hash parcial head+tail; cache de hash com
 validação size+mtime; varredura não-bloqueante (abas em segundos); conexão SQLite por thread.
 
-Itens ABERTOS para um futuro "Sprint de Escala" (ver auditoria):
-- E1 (ALTA): travessia dupla da árvore por disco (arquivos stat'd 2×) — unificar.
-- E2 (ALTA): top_largest_files materializa todos os arquivos antes do top-N — usar heap.
-- E3 (ALTA): SHA-256 em blocos de 8 KB — subir para 1 MB (principal causa dos ~73 min/3TB).
-- E4 (ALTA): file_index só guarda top-50 — limita a IA; persistir índice completo + índices SQLite.
-- E5–E8 (MÉDIA/BAIXA): escopo de duplicatas, contexto da IA no thread da UI, índices SQLite,
-  batches de upsert.
+Sprint de Escala — concluído em grande parte (2026-06-30):
+- E3 (feito): chunk de hash 8 KB → 1 MB (~128× menos iterações na Etapa 3).
+- E7 (feito): índices SQLite secundários (file_index/operation_history/suggestions).
+- E2 (feito): min-heap de tamanho N em top_largest_files — memória O(N).
+- E4 (feito): file_index passa a guardar TODO o conjunto varrido (não só top-50) +
+  upsert em lote (executemany) — a IA deixa de ficar cega ao disco.
+- E1 (deferido): unificar a travessia dupla (arquivos stat'd 2×) — alto risco de
+  regressão no core do scan para ganho marginal; reavaliar se a listagem virar gargalo.
+- E5/E6/E8 (MÉDIA/BAIXA, abertos): escopo de duplicatas sobre todos os arquivos,
+  contexto da IA fora do thread da UI, mais batches de upsert.
 
 ====================================================================
 8. EMPACOTAMENTO E DISTRIBUIÇÃO
