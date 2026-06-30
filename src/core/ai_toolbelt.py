@@ -32,7 +32,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from src.core.config import AI_MAX_EXEC_PER_MINUTE, AI_TOKEN_TTL_SECONDS
 from src.core.scanner import StorageScanner
@@ -185,6 +185,54 @@ def _reserve_exec_slot() -> dict | None:
             return _rate_limit_error()
         _exec_timestamps.append(now)
         return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Aprovação humana fora da banda (Hardening S5)
+# ─────────────────────────────────────────────────────────────────────────────
+# O "confirmation token" sozinho NÃO é consentimento humano — é a própria IA
+# que chama request_confirmation e usa o token no mesmo loop. Este seam permite
+# instalar um gate de aprovação REAL (ex.: a GUI mostra um diálogo modal ao
+# usuário). O hook recebe {action, description, risk_level, args} e devolve
+# True (autorizado) / False (negado).
+#
+# Default = nenhum hook → comportamento token-only (preserva back-compat, testes
+# e o servidor MCP, que pode instalar sua própria política). A GUI instala um
+# hook que exige clique humano antes de qualquer ação executiva.
+
+_approval_hook: Callable[[dict], bool] | None = None
+
+
+def set_approval_hook(hook: Callable[[dict], bool] | None) -> None:
+    """Instala (ou remove, com None) o gate de aprovação humana."""
+    global _approval_hook
+    _approval_hook = hook
+
+
+def _require_approval(action: str, args: dict) -> dict | None:
+    """
+    Consulta o hook de aprovação humana, se instalado. Retorna dict de erro
+    se negado, None se autorizado (ou se nenhum hook estiver instalado).
+    """
+    hook = _approval_hook
+    if hook is None:
+        return None
+    try:
+        approved = hook({
+            "action": action,
+            "description": _describe_action(action, args),
+            "risk_level": _assess_risk(action),
+            "args": args,
+        })
+    except Exception:
+        logger.exception("Hook de aprovação falhou — negando por segurança.")
+        approved = False
+    if not approved:
+        return {
+            "error": "APPROVAL_DENIED",
+            "message": "Ação executiva não foi aprovada pelo usuário.",
+        }
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -700,6 +748,8 @@ def move_to_trash(
         confirmation_token, "move_to_trash", {"path": path}
     ):
         return err
+    if err := _require_approval("move_to_trash", {"path": path}):
+        return err
     if err := _reserve_exec_slot():
         return err
     if err := _assert_safe(path, role="caminho"):
@@ -773,6 +823,10 @@ def move_file(
         {"source_path": source_path, "target_path": target_path},
     ):
         return err
+    if err := _require_approval(
+        "move_file", {"source_path": source_path, "target_path": target_path}
+    ):
+        return err
     if err := _reserve_exec_slot():
         return err
     # Sprint 7.2 (S-1, S-4): validar AMBOS origem e destino antes de qualquer I/O.
@@ -843,6 +897,8 @@ def apply_suggestion(
     if err := _validate_token(
         confirmation_token, "apply_suggestion", {"suggestion_id": suggestion_id}
     ):
+        return err
+    if err := _require_approval("apply_suggestion", {"suggestion_id": suggestion_id}):
         return err
     if err := _reserve_exec_slot():
         return err
@@ -976,6 +1032,8 @@ def undo_last_operation(
         {"operation_id": operation_id},
     ):
         return err
+    if err := _require_approval("undo_last_operation", {"operation_id": operation_id}):
+        return err
     if err := _reserve_exec_slot():
         return err
 
@@ -1063,6 +1121,10 @@ def set_disk_role(
         confirmation_token,
         "set_disk_role",
         {"drive_letter": drive_letter, "role": role},
+    ):
+        return err
+    if err := _require_approval(
+        "set_disk_role", {"drive_letter": drive_letter, "role": role}
     ):
         return err
     if err := _reserve_exec_slot():

@@ -31,6 +31,7 @@ import pytest
 PySide6 = pytest.importorskip("PySide6")
 
 from PySide6.QtGui import QCloseEvent  # noqa: E402  (após importorskip)
+from PySide6.QtWidgets import QMessageBox  # noqa: E402
 
 from src.gui.assistant_tab import AssistantTab, _execute_tool  # noqa: E402
 import src.core.ai_toolbelt as tb  # noqa: E402
@@ -66,6 +67,7 @@ def tab(qapp_session, tmp_path, monkeypatch):
     widget = AssistantTab()
     yield widget
     # Cleanup — equivalente ao closeEvent
+    tb.set_approval_hook(None)  # S5: não vazar o hook global entre testes
     try:
         widget.deleteLater()
     except Exception:
@@ -413,3 +415,62 @@ class TestExecuteToolHardening:
         assert _ALLOWED_TOOL_NAMES == schema_names
         assert "move_to_trash" in _ALLOWED_TOOL_NAMES
         assert "_reset_rate_limiter" not in _ALLOWED_TOOL_NAMES
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hardening S5 — gate de aprovação humana instalado pela GUI
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestApprovalGate:
+    def test_hook_installed_on_init(self, tab):
+        assert tb._approval_hook is not None
+        assert tb._approval_hook == tab._human_approval_hook
+
+    def test_hook_cleared_on_close(self, tab):
+        evt = QCloseEvent()
+        tab.closeEvent(evt)
+        assert tb._approval_hook is None
+
+    def test_on_approval_requested_yes(self, tab):
+        with patch(
+            "src.gui.assistant_tab.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            tab._approval_event = None  # sem worker bloqueado neste teste unitário
+            tab._on_approval_requested({"action": "move_to_trash",
+                                        "description": "Enviar x para Lixeira",
+                                        "risk_level": "low"})
+        assert tab._approval_result is True
+
+    def test_on_approval_requested_no(self, tab):
+        with patch(
+            "src.gui.assistant_tab.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.No,
+        ):
+            tab._approval_event = None
+            tab._on_approval_requested({"action": "move_to_trash",
+                                        "description": "x", "risk_level": "low"})
+        assert tab._approval_result is False
+
+    def test_hook_round_trip_approve(self, tab):
+        """_human_approval_hook → sinal → diálogo (mockado Yes) → True."""
+        # No mesmo thread, a conexão é direta: emit() executa
+        # _on_approval_requested sincronamente, que seta result+event.
+        with patch(
+            "src.gui.assistant_tab.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            approved = tab._human_approval_hook({"action": "move_to_trash",
+                                                 "description": "x",
+                                                 "risk_level": "low"})
+        assert approved is True
+
+    def test_hook_round_trip_deny(self, tab):
+        with patch(
+            "src.gui.assistant_tab.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.No,
+        ):
+            approved = tab._human_approval_hook({"action": "move_to_trash",
+                                                 "description": "x",
+                                                 "risk_level": "low"})
+        assert approved is False

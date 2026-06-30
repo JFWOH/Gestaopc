@@ -30,12 +30,14 @@ from src.core.storage_db import StorageManagerDB
 
 @pytest.fixture(autouse=True)
 def reset_globals():
-    """Garante estado limpo de rate limiter e token store entre cada teste."""
+    """Garante estado limpo de rate limiter, token store e approval hook."""
     tb._reset_rate_limiter()
     tb._reset_token_store()
+    tb.set_approval_hook(None)  # S5: rede de segurança contra hook vazado da GUI
     yield
     tb._reset_rate_limiter()
     tb._reset_token_store()
+    tb.set_approval_hook(None)
 
 
 @pytest.fixture()
@@ -150,6 +152,55 @@ class TestRateLimiter:
         assert len(granted) == tb._MAX_EXEC_PER_MINUTE, (
             f"esperava {tb._MAX_EXEC_PER_MINUTE} reservas, obteve {len(granted)}"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Aprovação humana fora da banda (S5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestApprovalHook:
+    def test_no_hook_proceeds(self):
+        """Sem hook instalado: comportamento token-only (back-compat)."""
+        assert tb._require_approval("move_to_trash", {"path": "D:/x"}) is None
+
+    def test_hook_denial_blocks_executive_action(self, tmp_path, tmp_db):
+        victim = tmp_path / "f.txt"
+        victim.write_text("x")
+        tb.set_approval_hook(lambda info: False)  # usuário NEGA
+        tok = tb.request_confirmation("move_to_trash", {"path": str(victim)})
+        result = tb.move_to_trash(str(victim), tok["token"])
+        assert result["error"] == "APPROVAL_DENIED"
+        assert victim.exists(), "arquivo não pode ter sido tocado"
+
+    def test_hook_approval_allows_action(self, tmp_path, tmp_db):
+        victim = tmp_path / "f.txt"
+        victim.write_text("x")
+        received = {}
+
+        def approve(info):
+            received.update(info)
+            return True
+
+        tb.set_approval_hook(approve)
+        tok = tb.request_confirmation("move_to_trash", {"path": str(victim)})
+        with patch.dict("sys.modules", {"send2trash": MagicMock(
+            send2trash=lambda p: Path(p).unlink(missing_ok=True)
+        )}):
+            result = tb.move_to_trash(str(victim), tok["token"])
+        assert result.get("success") is True
+        # O hook recebeu metadados úteis para o diálogo.
+        assert received["action"] == "move_to_trash"
+        assert "description" in received and "risk_level" in received
+
+    def test_hook_exception_denies(self, tmp_path, tmp_db):
+        """Hook que lança exceção → nega por segurança (fail-closed)."""
+        victim = tmp_path / "f.txt"
+        victim.write_text("x")
+        tb.set_approval_hook(lambda info: (_ for _ in ()).throw(RuntimeError("boom")))
+        tok = tb.request_confirmation("move_to_trash", {"path": str(victim)})
+        result = tb.move_to_trash(str(victim), tok["token"])
+        assert result["error"] == "APPROVAL_DENIED"
+        assert victim.exists()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
